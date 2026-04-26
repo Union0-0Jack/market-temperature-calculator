@@ -1,0 +1,3120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>股市计数温度计算器</title>
+  
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-slate-50">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useRef, useState } = React;
+
+    const CURRENT_DATA_SCHEMA_VERSION = 3;
+    const STORAGE_KEYS = {
+      // 历史 key 必须保持稳定，离线 HTML 覆盖更新后才能继续读到旧数据。
+      history: 'market-temperature-history-v1',
+      autoSave: 'market-temperature-auto-save-v1',
+      timeZone: 'market-temperature-time-zone-v1',
+      showChartValues: 'market-temperature-show-chart-values-v1',
+      showSpxTrend: 'market-temperature-show-spx-trend-v1',
+      schemaVersion: 'market-temperature-schema-version-v1',
+      migrationBackup: 'market-temperature-history-backup-before-v3-v1',
+    };
+    const TEMPERATURE_UNIT = '°';
+    const SPX_SYMBOL = '^GSPC';
+    const SPX_DATA_SOURCE = 'Financial Modeling Prep';
+    const SPX_MARKET_TIME_ZONE = 'America/New_York';
+    const DEFAULT_SPX_API_KEY = 'Fxo3FUzkCWYSCgOUTdh1JiLgRwtWfg0s';
+    const INPUT_MODES = {
+      counts: 'counts',
+      manual: 'manual',
+    };
+    const TIME_ZONE_OPTIONS = [
+      { key: 'America/New_York', label: '美东时间' },
+      { key: 'Asia/Shanghai', label: '北京时间' },
+    ];
+    const safeNumber = (value) => {
+      const parsed = parseFloat(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+
+    const getValidTimeZone = (value) =>
+      TIME_ZONE_OPTIONS.some((option) => option.key === value) ? value : TIME_ZONE_OPTIONS[0].key;
+
+    const getTimeZoneParts = (timestamp, timeZone) => {
+      const formatter = new Intl.DateTimeFormat('en-US', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hourCycle: 'h23',
+      });
+      const parts = formatter.formatToParts(new Date(timestamp));
+      const values = {};
+      parts.forEach((part) => {
+        if (part.type !== 'literal') values[part.type] = part.value;
+      });
+      return {
+        year: Number(values.year),
+        month: Number(values.month),
+        day: Number(values.day),
+        hour: Number(values.hour === '24' ? '0' : values.hour),
+        minute: Number(values.minute),
+        second: Number(values.second),
+      };
+    };
+
+    const getTimeZoneOffsetMs = (timestamp, timeZone) => {
+      const parts = getTimeZoneParts(timestamp, timeZone);
+      const utcTimestamp = Date.UTC(
+        parts.year,
+        parts.month - 1,
+        parts.day,
+        parts.hour,
+        parts.minute,
+        parts.second
+      );
+      return utcTimestamp - timestamp;
+    };
+
+    const parseDateTimeInTimeZone = (value, timeZone) => {
+      if (!value) return NaN;
+      const [datePart, timePart = '00:00'] = value.split('T');
+      const [year, month, day] = datePart.split('-').map(Number);
+      const [hour = 0, minute = 0] = timePart.split(':').map(Number);
+      if (![year, month, day, hour, minute].every(Number.isFinite)) return NaN;
+
+      const utcGuess = Date.UTC(year, month - 1, day, hour, minute);
+      const firstPass = utcGuess - getTimeZoneOffsetMs(utcGuess, timeZone);
+      return utcGuess - getTimeZoneOffsetMs(firstPass, timeZone);
+    };
+
+    const formatRecordDate = (timestamp, timeZone = TIME_ZONE_OPTIONS[0].key) =>
+      new Date(timestamp).toLocaleString('zh-CN', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+
+    const formatChartDate = (timestamp, timeZone = TIME_ZONE_OPTIONS[0].key) =>
+      new Date(timestamp).toLocaleDateString('zh-CN', {
+        timeZone,
+        month: 'numeric',
+        day: 'numeric',
+      });
+
+    const formatTemperature = (value) => `${safeNumber(value).toFixed(2)}${TEMPERATURE_UNIT}`;
+    const isManualRecord = (record) => record.inputMode === INPUT_MODES.manual;
+    const hasSpxValue = (record) => Number.isFinite(Number(record.spxValue)) && Number(record.spxValue) > 0;
+    const formatSpxValue = (value) => Number(value).toLocaleString('en-US', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+
+    const formatChartTooltip = (record, timeZone) => {
+      const rows = [
+        `时间：${formatRecordDate(record.timestamp, timeZone)}`,
+        `温度：${formatTemperature(record.temperature)}`,
+      ];
+
+      if (hasSpxValue(record)) {
+        rows.push(`SPX：${formatSpxValue(record.spxValue)}`);
+      }
+
+      if (isManualRecord(record)) {
+        rows.push('来源：手动输入温度');
+      } else {
+        rows.push(
+          `上涨：${record.upCount}`,
+          `下跌：${record.downCount}`,
+          `平盘：${record.flatCount}`,
+          `总家数：${record.totalCount}`
+        );
+      }
+
+      return rows.join('\n');
+    };
+
+    const RANGE_OPTIONS = [
+      { key: '5', label: '近5日', days: 5 },
+      { key: '20', label: '近20日', days: 20 },
+      { key: '60', label: '近60日', days: 60 },
+      { key: 'all', label: '全部', days: Infinity },
+    ];
+
+    const formatDateTimeLocalValue = (timestamp, timeZone = TIME_ZONE_OPTIONS[0].key) => {
+      const date = getTimeZoneParts(timestamp, timeZone);
+      const year = date.year;
+      const month = String(date.month).padStart(2, '0');
+      const day = String(date.day).padStart(2, '0');
+      const hours = String(date.hour).padStart(2, '0');
+      const minutes = String(date.minute).padStart(2, '0');
+      return `${year}-${month}-${day}T${hours}:${minutes}`;
+    };
+
+    const formatFileDate = (date = new Date()) =>
+      [
+        date.getFullYear(),
+        String(date.getMonth() + 1).padStart(2, '0'),
+        String(date.getDate()).padStart(2, '0'),
+      ].join('-');
+
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    const formatDateInputValue = (date) =>
+      [
+        date.getUTCFullYear(),
+        String(date.getUTCMonth() + 1).padStart(2, '0'),
+        String(date.getUTCDate()).padStart(2, '0'),
+      ].join('-');
+
+    const formatRecordDateFilterValue = (timestamp, timeZone) => {
+      const parts = getTimeZoneParts(timestamp, timeZone);
+      return [
+        parts.year,
+        String(parts.month).padStart(2, '0'),
+        String(parts.day).padStart(2, '0'),
+      ].join('-');
+    };
+
+    const shiftDateInputValue = (dateValue, dayOffset) => {
+      const [year, month, day] = dateValue.split('-').map(Number);
+      const date = new Date(Date.UTC(year, month - 1, day) + dayOffset * DAY_MS);
+      return formatDateInputValue(date);
+    };
+
+    const parseSpxRows = (payload) => {
+      if (payload && (payload['Error Message'] || payload['Note'] || payload.error)) {
+        throw new Error(payload['Error Message'] || payload['Note'] || payload.error || 'SPX 数据源返回错误。');
+      }
+
+      const rawRows = Array.isArray(payload && payload.historical)
+        ? payload.historical
+        : (Array.isArray(payload) ? payload : []);
+
+      return rawRows
+        .map((row) => ({
+          date: row.date,
+          close: Number(row.close),
+        }))
+        .filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date) && Number.isFinite(row.close) && row.close > 0)
+        .sort((a, b) => a.date.localeCompare(b.date));
+    };
+
+    const fetchSpxRowsForDateRange = async (startDate, endDate, apiKey) => {
+      if (!apiKey || !apiKey.trim()) {
+        throw new Error('内置 SPX API Key 缺失，无法刷新 SPX。');
+      }
+      const url = `https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=${encodeURIComponent(SPX_SYMBOL)}&from=${startDate}&to=${endDate}&apikey=${encodeURIComponent(apiKey.trim())}`;
+
+      const response = await fetch(url, { cache: 'no-store' });
+      if (!response.ok) {
+        throw new Error(`SPX 数据请求失败：HTTP ${response.status}`);
+      }
+
+      const payload = await response.json();
+      const rows = parseSpxRows(payload);
+      if (!rows.length) {
+        throw new Error('未找到可用的 SPX 收盘数据。');
+      }
+
+      return rows;
+    };
+
+    const pickSpxCloseForMarketDate = (rows, targetMarketDate) => {
+      const matchedRows = rows.filter((row) => row.date <= targetMarketDate);
+      const selectedRow = matchedRows[matchedRows.length - 1] || rows[0];
+      return {
+        value: Number(selectedRow.close.toFixed(2)),
+        marketDate: selectedRow.date,
+        source: SPX_DATA_SOURCE,
+      };
+    };
+
+    const fetchSpxCloseForTimestamp = async (timestamp, apiKey) => {
+      if (!Number.isFinite(Number(timestamp))) {
+        throw new Error('缺少有效日期，无法匹配 SPX。');
+      }
+
+      const targetMarketDate = formatRecordDateFilterValue(timestamp, SPX_MARKET_TIME_ZONE);
+      const startDate = shiftDateInputValue(targetMarketDate, -7);
+      const endDate = shiftDateInputValue(targetMarketDate, 2);
+      const rows = await fetchSpxRowsForDateRange(startDate, endDate, apiKey);
+      return pickSpxCloseForMarketDate(rows, targetMarketDate);
+    };
+
+    const getRangeStartTimestamp = (latestTimestamp, days, timeZone) => {
+      if (days === Infinity) return -Infinity;
+
+      const latestParts = getTimeZoneParts(latestTimestamp, timeZone);
+      const latestDateUtc = Date.UTC(latestParts.year, latestParts.month - 1, latestParts.day);
+      const startDate = new Date(latestDateUtc - (days - 1) * DAY_MS);
+      return parseDateTimeInTimeZone(`${formatDateInputValue(startDate)}T00:00`, timeZone);
+    };
+
+    const getLatestRecordTimestamp = (records) =>
+      records.reduce(
+        (latest, record) => Math.max(latest, Number(record.timestamp)),
+        records.length ? Number(records[0].timestamp) : 0
+      );
+
+    const filterRecordsByRange = (records, rangeOption, timeZone) => {
+      if (!records.length || rangeOption.days === Infinity) return records;
+
+      const latestTimestamp = getLatestRecordTimestamp(records);
+      const startTimestamp = getRangeStartTimestamp(latestTimestamp, rangeOption.days, timeZone);
+      if (!Number.isFinite(startTimestamp)) return records;
+
+      return records.filter((record) => record.timestamp >= startTimestamp);
+    };
+
+    const getRecordSignature = (record) =>
+      [
+        record.inputMode || INPUT_MODES.counts,
+        record.inputMode === INPUT_MODES.manual ? Number(record.timestamp).toFixed(0) : '',
+        safeNumber(record.upCount).toFixed(4),
+        safeNumber(record.downCount).toFixed(4),
+        safeNumber(record.flatCount).toFixed(4),
+        safeNumber(record.temperature).toFixed(4),
+        hasSpxValue(record) ? Number(record.spxValue).toFixed(4) : '',
+      ].join('|');
+
+    const normalizeStoredRecord = (record) => {
+      if (!record || typeof record !== 'object') return null;
+
+      const timestamp = Number(record.timestamp);
+      const upCount = safeNumber(record.upCount);
+      const downCount = safeNumber(record.downCount);
+      const flatCount = safeNumber(record.flatCount);
+      const totalCount = safeNumber(record.totalCount) || upCount + downCount + flatCount;
+      const temperature = safeNumber(record.temperature);
+      const rawSpxValue = Number(record.spxValue);
+      const spxValue = Number.isFinite(rawSpxValue) && rawSpxValue > 0
+        ? Number(rawSpxValue.toFixed(2))
+        : null;
+      const inputMode = record.inputMode === INPUT_MODES.manual || totalCount <= 0
+        ? INPUT_MODES.manual
+        : INPUT_MODES.counts;
+
+      if (!Number.isFinite(timestamp) || temperature < 0 || temperature > 100) return null;
+      if (inputMode === INPUT_MODES.counts && totalCount <= 0) return null;
+
+      return {
+        id: record.id || String(timestamp),
+        timestamp,
+        inputMode,
+        dateLabel: record.dateLabel || formatRecordDate(timestamp),
+        upCount,
+        downCount,
+        flatCount,
+        totalCount,
+        temperature,
+        spxValue,
+      };
+    };
+
+    const normalizeHistoryRecords = (records) => {
+      if (!Array.isArray(records)) return [];
+
+      return records
+        .map(normalizeStoredRecord)
+        .filter(Boolean)
+        .sort((a, b) => b.timestamp - a.timestamp);
+    };
+
+    const migrateStoredHistory = () => {
+      const raw = window.localStorage.getItem(STORAGE_KEYS.history);
+      if (!raw) {
+        window.localStorage.setItem(STORAGE_KEYS.schemaVersion, String(CURRENT_DATA_SCHEMA_VERSION));
+        return [];
+      }
+
+      const parsed = JSON.parse(raw);
+      const normalizedRecords = normalizeHistoryRecords(parsed);
+      const storedVersion = Number(window.localStorage.getItem(STORAGE_KEYS.schemaVersion)) || 1;
+      const normalizedJson = JSON.stringify(normalizedRecords);
+
+      if (storedVersion < CURRENT_DATA_SCHEMA_VERSION || raw !== normalizedJson) {
+        if (!window.localStorage.getItem(STORAGE_KEYS.migrationBackup)) {
+          window.localStorage.setItem(STORAGE_KEYS.migrationBackup, raw);
+        }
+        window.localStorage.setItem(STORAGE_KEYS.history, normalizedJson);
+        window.localStorage.setItem(STORAGE_KEYS.schemaVersion, String(CURRENT_DATA_SCHEMA_VERSION));
+      }
+
+      return normalizedRecords;
+    };
+
+    const loadHistoryRecords = () => {
+      try {
+        return migrateStoredHistory();
+      } catch (error) {
+        return [];
+      }
+    };
+
+    const loadAutoSavePreference = () => {
+      try {
+        return window.localStorage.getItem(STORAGE_KEYS.autoSave) === 'true';
+      } catch (error) {
+        return false;
+      }
+    };
+
+    const loadTimeZonePreference = () => {
+      try {
+        return getValidTimeZone(window.localStorage.getItem(STORAGE_KEYS.timeZone));
+      } catch (error) {
+        return TIME_ZONE_OPTIONS[0].key;
+      }
+    };
+
+    const loadShowChartValuesPreference = () => {
+      try {
+        const raw = window.localStorage.getItem(STORAGE_KEYS.showChartValues);
+        return raw === null ? true : raw === 'true';
+      } catch (error) {
+        return true;
+      }
+    };
+
+    const loadShowSpxTrendPreference = () => {
+      try {
+        return window.localStorage.getItem(STORAGE_KEYS.showSpxTrend) === 'true';
+      } catch (error) {
+        return false;
+      }
+    };
+
+    const escapeCsvValue = (value) => {
+      const text = String(value);
+      if (text.includes('"') || text.includes(',') || text.includes('\n')) {
+        return `"${text.replace(/"/g, '""')}"`;
+      }
+      return text;
+    };
+
+    const downloadTextFile = (content, filename, mimeType) => {
+      const blob = new Blob([content], { type: mimeType });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.setTimeout(() => window.URL.revokeObjectURL(url), 0);
+    };
+
+    // 定义所需图标 (SVG 格式)
+    const ActivityIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+    );
+    const TrendingUpIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>
+    );
+    const TrendingDownIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="22 17 13.5 8.5 8.5 13.5 2 7"/><polyline points="16 17 22 17 22 11"/></svg>
+    );
+    const MinusIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    );
+    const PlusIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+    );
+    const RotateCcwIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M3 12a9 9 0 1 0 3-6.7"></path><path d="M3 4v6h6"></path></svg>
+    );
+    const ThermometerIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
+    );
+    const SaveIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>
+    );
+    const DownloadIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+    );
+    const TrashIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>
+    );
+    const HistoryIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M3 3v5h5"></path><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"></path><path d="M12 7v5l4 2"></path></svg>
+    );
+    const ChartIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M3 3v18h18"></path><path d="M7 14l4-4 3 3 5-7"></path></svg>
+    );
+    const EditIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>
+    );
+    const XIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+    );
+    const CheckSquareIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="m9 12 2 2 4-4"></path></svg>
+    );
+    const ExpandIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M8 3H5a2 2 0 0 0-2 2v3"></path><path d="M16 3h3a2 2 0 0 1 2 2v3"></path><path d="M8 21H5a2 2 0 0 1-2-2v-3"></path><path d="M16 21h3a2 2 0 0 0 2-2v-3"></path></svg>
+    );
+    const TargetIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><circle cx="12" cy="12" r="9"></circle><circle cx="12" cy="12" r="5"></circle><path d="M12 3v4"></path><path d="M12 17v4"></path><path d="M3 12h4"></path><path d="M17 12h4"></path></svg>
+    );
+    const CandlestickIcon = ({ size, className }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M6 3v18"></path><rect x="4" y="7" width="4" height="8" rx="1"></rect><path d="M12 3v18"></path><rect x="10" y="5" width="4" height="12" rx="1"></rect><path d="M18 3v18"></path><rect x="16" y="9" width="4" height="7" rx="1"></rect></svg>
+    );
+
+    const StatCard = ({ label, value, accentClass }) => (
+      <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+        <div className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">{label}</div>
+        <div className={`mt-2 text-2xl font-black ${accentClass}`}>{value}</div>
+      </div>
+    );
+
+    const getTemperatureTextClass = (value) => {
+      if (value === null || value === undefined) return 'text-slate-900';
+      if (value > 60) return 'text-red-600';
+      if (value < 20) return 'text-green-600';
+      return 'text-slate-950';
+    };
+
+    function PriceTargetCalculator() {
+      const [mode, setMode] = useState('rise');
+      const [pointA, setPointA] = useState('');
+      const [pointB, setPointB] = useState('');
+      const [result, setResult] = useState(null);
+      const isRiseMode = mode === 'rise';
+      const handlePriceInputFocus = (event) => event.target.select();
+      const modeConfig = isRiseMode
+        ? {
+            title: '上涨测回调',
+            subtitle: 'A 为起点低点，B 为阶段高点，计算回调目标位。',
+            labelA: 'A点价格（起点/低点）',
+            labelB: 'B点价格（高点）',
+            formula: '0.749A + 0.251B',
+            weighted: (a, b) => 0.749 * a + 0.251 * b,
+          }
+        : {
+            title: '下跌测反弹',
+            subtitle: 'A 为起点高点，B 为阶段低点，计算反弹目标位。',
+            labelA: 'A点价格（起点/高点）',
+            labelB: 'B点价格（低点）',
+            formula: '0.746A + 0.254B',
+            weighted: (a, b) => 0.746 * a + 0.254 * b,
+          };
+
+      const handleModeChange = (nextMode) => {
+        setMode(nextMode);
+        setResult(null);
+      };
+
+      const calculateTargets = () => {
+        const a = Number(pointA);
+        const b = Number(pointB);
+        if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) {
+          setResult({ error: '请先输入大于 0 的 A 点和 B 点价格。' });
+          return;
+        }
+
+        setResult({
+          geometric: Math.sqrt(a * b),
+          weighted: modeConfig.weighted(a, b),
+          error: '',
+        });
+      };
+
+      const Diagram = () => (
+        <svg width="100%" height="180" viewBox="0 0 320 180" className="overflow-visible">
+          {isRiseMode ? (
+            <g>
+              <path d="M 48 142 L 150 42" stroke="#2563eb" strokeWidth="4" fill="none" strokeLinecap="round" />
+              <path d="M 150 42 L 220 102" stroke="#38bdf8" strokeWidth="3" strokeDasharray="8 6" fill="none" strokeLinecap="round" />
+              <circle cx="48" cy="142" r="6" fill="#2563eb" />
+              <circle cx="150" cy="42" r="6" fill="#2563eb" />
+              <text x="42" y="164" textAnchor="middle" className="fill-slate-900 text-base font-black">A</text>
+              <text x="150" y="28" textAnchor="middle" className="fill-slate-900 text-base font-black">B</text>
+              <text x="232" y="106" className="fill-sky-600 text-base font-black">C?</text>
+              <text x="54" y="178" textAnchor="middle" className="fill-slate-500 text-xs font-semibold">起点低</text>
+              <text x="176" y="32" className="fill-slate-500 text-xs font-semibold">高点</text>
+              <text x="232" y="124" className="fill-slate-500 text-xs font-semibold">回调目标</text>
+            </g>
+          ) : (
+            <g>
+              <path d="M 48 42 L 150 142" stroke="#2563eb" strokeWidth="4" fill="none" strokeLinecap="round" />
+              <path d="M 150 142 L 220 92" stroke="#38bdf8" strokeWidth="3" strokeDasharray="8 6" fill="none" strokeLinecap="round" />
+              <circle cx="48" cy="42" r="6" fill="#2563eb" />
+              <circle cx="150" cy="142" r="6" fill="#2563eb" />
+              <text x="42" y="34" textAnchor="middle" className="fill-slate-900 text-base font-black">A</text>
+              <text x="150" y="164" textAnchor="middle" className="fill-slate-900 text-base font-black">B</text>
+              <text x="232" y="96" className="fill-sky-600 text-base font-black">C?</text>
+              <text x="54" y="56" textAnchor="middle" className="fill-slate-500 text-xs font-semibold">起点高</text>
+              <text x="176" y="164" className="fill-slate-500 text-xs font-semibold">低点</text>
+              <text x="232" y="78" className="fill-slate-500 text-xs font-semibold">反弹目标</text>
+            </g>
+          )}
+        </svg>
+      );
+
+      return (
+        <div className="mx-auto max-w-3xl">
+          <div className="overflow-hidden rounded-3xl border border-slate-100 bg-white shadow-xl">
+            <div className="bg-slate-800 p-6 text-center text-white">
+              <div className="mb-3 flex justify-center">
+                <TargetIcon size={40} className="text-sky-300" />
+              </div>
+              <h1 className="text-2xl font-bold tracking-wider">金融回撤/反弹计算器</h1>
+              <p className="mt-2 text-sm text-slate-400 opacity-80">输入 A/B 两个关键点，计算几何平均与加权目标位</p>
+            </div>
+
+            <div className="p-6">
+              <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-1">
+                <button
+                  type="button"
+                  onClick={() => handleModeChange('rise')}
+                  className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                    isRiseMode ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  上涨测回调
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleModeChange('fall')}
+                  className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                    !isRiseMode ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  下跌测反弹
+                </button>
+              </div>
+
+              <div className="mt-6 rounded-2xl border border-slate-100 bg-slate-50 p-4">
+                <Diagram />
+              </div>
+
+              <div className="mt-6 grid gap-4">
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">{modeConfig.labelA}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={pointA}
+                    onChange={(event) => setPointA(event.target.value)}
+                    onFocus={handlePriceInputFocus}
+                    placeholder="请输入价格"
+                    className="w-full rounded-lg border border-slate-200 bg-white px-4 py-3 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">{modeConfig.labelB}</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={pointB}
+                    onChange={(event) => setPointB(event.target.value)}
+                    onFocus={handlePriceInputFocus}
+                    placeholder="请输入价格"
+                    className="w-full rounded-lg border border-slate-200 bg-white px-4 py-3 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={calculateTargets}
+                  className="rounded-xl bg-slate-900 px-4 py-3 text-base font-semibold text-white transition hover:bg-slate-700"
+                >
+                  开始计算目标位
+                </button>
+              </div>
+
+              <div className="mt-6 rounded-2xl border border-slate-100 bg-slate-50 p-5">
+                <div className="mb-3">
+                  <h2 className="text-lg font-bold text-slate-800">{modeConfig.title}</h2>
+                  <p className="mt-1 text-sm text-slate-500">{modeConfig.subtitle}</p>
+                </div>
+                {result && result.error ? (
+                  <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-700">{result.error}</div>
+                ) : (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-xl border border-emerald-100 bg-white p-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">目标位一</div>
+                      <div className="mt-1 text-xs text-slate-500">公式：√A×B</div>
+                      <div className="mt-3 text-2xl font-black text-emerald-700">
+                        {result ? result.geometric.toFixed(4) : '--'}
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-blue-100 bg-white p-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">目标位二</div>
+                      <div className="mt-1 text-xs text-slate-500">公式：{modeConfig.formula}</div>
+                      <div className="mt-3 text-2xl font-black text-blue-700">
+                        {result ? result.weighted.toFixed(4) : '--'}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function KLineNextDayCalculator() {
+      const [candleType, setCandleType] = useState('bullish');
+      const [high, setHigh] = useState('');
+      const [low, setLow] = useState('');
+      const [close, setClose] = useState('');
+      const [result, setResult] = useState(null);
+      const handleKLineInputFocus = (event) => event.target.select();
+      const candleOptions = [
+        {
+          key: 'bullish',
+          label: '阳线',
+          tone: 'text-red-700',
+          bg: 'bg-red-50',
+          border: 'border-red-100',
+          formula: 'R =（高点 × 2 + 低点 + 收盘价）÷ 2',
+          getBase: (h, l, c) => (h * 2 + l + c) / 2,
+        },
+        {
+          key: 'bearish',
+          label: '阴线',
+          tone: 'text-green-700',
+          bg: 'bg-green-50',
+          border: 'border-green-100',
+          formula: 'R =（低点 × 2 + 高点 + 收盘价）÷ 2',
+          getBase: (h, l, c) => (l * 2 + h + c) / 2,
+        },
+        {
+          key: 'doji',
+          label: '十字星',
+          tone: 'text-blue-700',
+          bg: 'bg-blue-50',
+          border: 'border-blue-100',
+          formula: 'R =（收盘价 × 2 + 高点 + 低点）÷ 2',
+          getBase: (h, l, c) => (c * 2 + h + l) / 2,
+        },
+      ];
+      const activeOption = candleOptions.find((option) => option.key === candleType) || candleOptions[0];
+
+      const calculateNextDayLevels = () => {
+        const highValue = Number(high);
+        const lowValue = Number(low);
+        const closeValue = Number(close);
+
+        if (![highValue, lowValue, closeValue].every((value) => Number.isFinite(value) && value > 0)) {
+          setResult({ error: '请填写大于 0 的高点、低点和收盘价。' });
+          return;
+        }
+        if (highValue < lowValue) {
+          setResult({ error: '高点不能低于低点，请检查输入。' });
+          return;
+        }
+        if (closeValue > highValue || closeValue < lowValue) {
+          setResult({ error: '收盘价应位于高点和低点之间。' });
+          return;
+        }
+
+        const baseValue = activeOption.getBase(highValue, lowValue, closeValue);
+        setResult({
+          baseValue,
+          nextHigh: baseValue - lowValue,
+          nextLow: baseValue - highValue,
+          range: highValue - lowValue,
+          error: '',
+        });
+      };
+
+      const resetInputs = () => {
+        setHigh('');
+        setLow('');
+        setClose('');
+        setResult(null);
+      };
+
+      return (
+        <div className="mx-auto max-w-4xl">
+          <div className="overflow-hidden rounded-3xl border border-slate-100 bg-white shadow-xl">
+            <div className="bg-slate-800 p-6 text-center text-white">
+              <div className="mb-3 flex justify-center">
+                <CandlestickIcon size={40} className="text-amber-300" />
+              </div>
+              <h1 className="text-2xl font-bold tracking-wider">一根 K 线计算次日高低点</h1>
+              <p className="mt-2 text-sm text-slate-400 opacity-80">按 K 线形态选择基值 R 公式，并计算明日高点与明日低点</p>
+            </div>
+
+            <div className="grid gap-6 p-6 lg:grid-cols-[minmax(0,1fr)_300px]">
+              <div className="space-y-6">
+                <div className="grid grid-cols-3 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-1">
+                  {candleOptions.map((option) => (
+                    <button
+                      key={option.key}
+                      type="button"
+                      onClick={() => {
+                        setCandleType(option.key);
+                        setResult(null);
+                      }}
+                      className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                        candleType === option.key
+                          ? `bg-white ${option.tone} shadow-sm`
+                          : 'text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className={`rounded-2xl border p-4 ${activeOption.bg} ${activeOption.border}`}>
+                  <div className={`text-sm font-bold ${activeOption.tone}`}>{activeOption.label}基值公式</div>
+                  <div className="mt-2 text-sm font-semibold text-slate-700">{activeOption.formula}</div>
+                  <div className="mt-2 text-xs text-slate-500">明日高点 = R - 低点；明日低点 = R - 高点。</div>
+                </div>
+
+                <div className="grid gap-4 sm:grid-cols-3">
+                  <label className="block">
+                    <span className="mb-1 block text-sm font-medium text-slate-600">高点</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={high}
+                      onChange={(event) => setHigh(event.target.value)}
+                      onFocus={handleKLineInputFocus}
+                      placeholder="High"
+                      className="w-full rounded-lg border border-slate-200 bg-white px-4 py-3 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-red-400 focus:ring-2 focus:ring-red-100"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="mb-1 block text-sm font-medium text-slate-600">低点</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={low}
+                      onChange={(event) => setLow(event.target.value)}
+                      onFocus={handleKLineInputFocus}
+                      placeholder="Low"
+                      className="w-full rounded-lg border border-slate-200 bg-white px-4 py-3 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-green-400 focus:ring-2 focus:ring-green-100"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="mb-1 block text-sm font-medium text-slate-600">收盘价</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={close}
+                      onChange={(event) => setClose(event.target.value)}
+                      onFocus={handleKLineInputFocus}
+                      placeholder="Close"
+                      className="w-full rounded-lg border border-slate-200 bg-white px-4 py-3 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+                    />
+                  </label>
+                </div>
+
+                <div className="flex flex-wrap gap-3">
+                  <button
+                    type="button"
+                    onClick={calculateNextDayLevels}
+                    className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 py-3 text-base font-semibold text-white transition hover:bg-slate-700 sm:flex-none"
+                  >
+                    <CandlestickIcon size={18} />
+                    <span>计算次日高低点</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={resetInputs}
+                    className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-base font-semibold text-slate-700 transition hover:border-slate-300"
+                  >
+                    清空
+                  </button>
+                </div>
+
+                {result && result.error ? (
+                  <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-700">{result.error}</div>
+                ) : null}
+              </div>
+
+              <div className="space-y-4">
+                <div className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
+                  <div className="mb-3 flex items-center gap-2">
+                    <CandlestickIcon size={20} className={activeOption.tone} />
+                    <h2 className="text-lg font-bold text-slate-800">计算结果</h2>
+                  </div>
+                  <div className="space-y-3">
+                    <div className="rounded-xl border border-slate-200 bg-white p-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">基值 R</div>
+                      <div className="mt-2 text-2xl font-black text-slate-900">
+                        {result && !result.error ? result.baseValue.toFixed(4) : '--'}
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-red-100 bg-white p-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">明日高点</div>
+                      <div className="mt-2 text-2xl font-black text-red-700">
+                        {result && !result.error ? result.nextHigh.toFixed(4) : '--'}
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-green-100 bg-white p-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">明日低点</div>
+                      <div className="mt-2 text-2xl font-black text-green-700">
+                        {result && !result.error ? result.nextLow.toFixed(4) : '--'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="text-sm font-bold text-slate-800">辅助检查</div>
+                  <div className="mt-3 grid gap-2 text-sm text-slate-600">
+                    <div className="flex justify-between gap-3">
+                      <span>当日振幅</span>
+                      <span className="font-bold text-slate-900">{result && !result.error ? result.range.toFixed(4) : '--'}</span>
+                    </div>
+                    <div className="flex justify-between gap-3">
+                      <span>当前形态</span>
+                      <span className={`font-bold ${activeOption.tone}`}>{activeOption.label}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function HistoryChart({
+      records,
+      rangeLabel,
+      timeZone,
+      showValues,
+      showSpxTrend,
+      isFullscreen = false,
+      onExpand,
+      onClose,
+      rangeOptions = [],
+      activeRangeKey = '',
+      onRangeChange,
+    }) {
+      const chartRecords = records.slice().sort((a, b) => a.timestamp - b.timestamp);
+      const maxRecordIndex = Math.max(chartRecords.length - 1, 0);
+      const getFullViewWindow = () => ({ start: 0, end: maxRecordIndex });
+      const [activePointId, setActivePointId] = useState(null);
+      const [viewWindow, setViewWindow] = useState(getFullViewWindow);
+      const interactionRef = useRef(null);
+      const chartClipId = useRef(`history-chart-clip-${Math.random().toString(36).slice(2)}`).current;
+      const firstRecordId = chartRecords[0] ? chartRecords[0].id : '';
+      const lastRecordId = chartRecords[chartRecords.length - 1] ? chartRecords[chartRecords.length - 1].id : '';
+
+      useEffect(() => {
+        setViewWindow(getFullViewWindow());
+        setActivePointId(null);
+      }, [chartRecords.length, firstRecordId, lastRecordId, activeRangeKey]);
+
+      if (!records.length) {
+        return (
+          <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
+            目前还没有历史记录，先保存几笔数据后就能看到时间轴趋势。
+          </div>
+        );
+      }
+
+      const width = 760;
+      const height = isFullscreen ? 360 : 260;
+      const spxValues = chartRecords.filter(hasSpxValue).map((record) => Number(record.spxValue));
+      const hasVisibleSpxValues = spxValues.length > 0;
+      const shouldShowSpxTrend = showSpxTrend && hasVisibleSpxValues;
+      const padding = { top: 20, right: 16, bottom: 42, left: 40 };
+      const innerWidth = width - padding.left - padding.right;
+      const innerHeight = height - padding.top - padding.bottom;
+      const lowThreshold = 20;
+      const highThreshold = 60;
+      const temperatures = chartRecords.map((record) => record.temperature);
+      const minTemperature = Math.min(...temperatures);
+      const maxTemperature = Math.max(...temperatures);
+      const yMin = Math.max(0, Math.min(lowThreshold, Math.floor((minTemperature - 5) / 5) * 5));
+      const yMax = Math.min(100, Math.max(highThreshold, Math.ceil((maxTemperature + 5) / 5) * 5));
+      const ySpan = Math.max(1, yMax - yMin);
+      const tickValues = [lowThreshold, highThreshold];
+      const minSpxValue = hasVisibleSpxValues ? Math.min(...spxValues) : 0;
+      const maxSpxValue = hasVisibleSpxValues ? Math.max(...spxValues) : 0;
+      const spxPadding = Math.max(10, (maxSpxValue - minSpxValue) * 0.08);
+      const spxMin = Math.max(0, minSpxValue - spxPadding);
+      const spxMax = maxSpxValue + spxPadding;
+      const spxSpan = spxMax - spxMin;
+      const minVisibleSpan = Math.min(6, maxRecordIndex);
+
+      const clampViewWindow = (nextWindow) => {
+        if (maxRecordIndex <= 0) return { start: 0, end: 0 };
+
+        let start = Number.isFinite(nextWindow.start) ? nextWindow.start : 0;
+        let end = Number.isFinite(nextWindow.end) ? nextWindow.end : maxRecordIndex;
+        if (end < start) [start, end] = [end, start];
+
+        let span = end - start;
+        if (span < minVisibleSpan) {
+          const center = (start + end) / 2;
+          start = center - minVisibleSpan / 2;
+          end = center + minVisibleSpan / 2;
+          span = minVisibleSpan;
+        }
+
+        if (span >= maxRecordIndex) return { start: 0, end: maxRecordIndex };
+
+        if (start < 0) {
+          end -= start;
+          start = 0;
+        }
+        if (end > maxRecordIndex) {
+          start -= end - maxRecordIndex;
+          end = maxRecordIndex;
+        }
+
+        return {
+          start: Math.max(0, start),
+          end: Math.min(maxRecordIndex, end),
+        };
+      };
+
+      const view = clampViewWindow(viewWindow);
+      const viewSpan = Math.max(1, view.end - view.start);
+      const isZoomed = maxRecordIndex > 0 && viewSpan < maxRecordIndex - 0.01;
+      const canZoom = maxRecordIndex > minVisibleSpan;
+
+      const getX = (index) => {
+        if (chartRecords.length === 1 || maxRecordIndex <= 0) {
+          return padding.left + innerWidth / 2;
+        }
+        return padding.left + ((index - view.start) / viewSpan) * innerWidth;
+      };
+
+      const getY = (value) => padding.top + innerHeight - ((value - yMin) / ySpan) * innerHeight;
+      const getSpxY = (value) => {
+        if (!shouldShowSpxTrend || spxSpan <= 0) return padding.top + innerHeight / 2;
+        return padding.top + innerHeight - ((value - spxMin) / spxSpan) * innerHeight;
+      };
+
+      const getTemperatureTone = (value) => {
+        if (value > highThreshold) {
+          return {
+            stroke: '#dc2626',
+            fill: '#dc2626',
+            text: 'fill-red-600',
+            halo: 'rgba(220, 38, 38, 0.16)',
+          };
+        }
+        if (value < lowThreshold) {
+          return {
+            stroke: '#16a34a',
+            fill: '#16a34a',
+            text: 'fill-green-600',
+            halo: 'rgba(22, 163, 74, 0.16)',
+          };
+        }
+        return {
+          stroke: '#0f172a',
+          fill: '#0f172a',
+          text: 'fill-slate-950',
+          halo: 'rgba(15, 23, 42, 0.12)',
+        };
+      };
+
+      const points = chartRecords.map((record, index) => ({
+        ...record,
+        chartIndex: index,
+        x: getX(index),
+        y: getY(record.temperature),
+        spxY: hasSpxValue(record) ? getSpxY(Number(record.spxValue)) : null,
+      }));
+      const visiblePoints = points.filter((point) => point.chartIndex >= view.start - 0.001 && point.chartIndex <= view.end + 0.001);
+
+      const getDateLabelAnchor = (x) => {
+        if (x < padding.left + 28) return 'start';
+        if (x > width - padding.right - 28) return 'end';
+        return 'middle';
+      };
+
+      const lineSegments = points.slice(1).map((point, index) => {
+        const previousPoint = points[index];
+        const segmentTone = getTemperatureTone(point.temperature);
+        return {
+          key: `${previousPoint.id}-${point.id}`,
+          x1: previousPoint.x,
+          y1: previousPoint.y,
+          x2: point.x,
+          y2: point.y,
+          stroke: segmentTone.stroke,
+        };
+      }).filter((segment) => segment.x1 <= width - padding.right && segment.x2 >= padding.left);
+      const spxPoints = points.filter(hasSpxValue);
+      const spxLineSegments = shouldShowSpxTrend
+        ? spxPoints.slice(1).map((point, index) => {
+            const previousPoint = spxPoints[index];
+            return {
+              key: `spx-${previousPoint.id}-${point.id}`,
+              x1: previousPoint.x,
+              y1: previousPoint.spxY,
+              x2: point.x,
+              y2: point.spxY,
+            };
+          }).filter((segment) => segment.x1 <= width - padding.right && segment.x2 >= padding.left)
+        : [];
+      const visibleDateLabelIndexes = (() => {
+        if (points.length <= 1) return new Set(points.map((_, index) => index));
+
+        const firstVisibleIndex = Math.max(0, Math.ceil(view.start));
+        const lastVisibleIndex = Math.min(maxRecordIndex, Math.floor(view.end));
+        if (firstVisibleIndex > lastVisibleIndex) return new Set();
+
+        const visibleCount = lastVisibleIndex - firstVisibleIndex + 1;
+        const targetCount = Math.min(isFullscreen ? 8 : 6, visibleCount);
+        if (targetCount <= 1) return new Set([firstVisibleIndex]);
+
+        const indexes = new Set();
+        const step = (lastVisibleIndex - firstVisibleIndex) / (targetCount - 1);
+        for (let index = 0; index < targetCount; index += 1) {
+          indexes.add(Math.round(firstVisibleIndex + step * index));
+        }
+        return indexes;
+      })();
+      const activePoint = points.find((point) => point.id === activePointId);
+      const tooltipWidth = 170;
+      const tooltipHeight = activePoint && hasSpxValue(activePoint) ? 78 : 62;
+      const tooltipX = activePoint
+        ? Math.min(
+            Math.max(
+              activePoint.x > width - padding.right - tooltipWidth - 12
+                ? activePoint.x - tooltipWidth - 12
+                : activePoint.x + 12,
+              padding.left
+            ),
+            width - padding.right - tooltipWidth
+          )
+        : 0;
+      const tooltipY = activePoint
+        ? Math.min(
+            Math.max(activePoint.y < padding.top + tooltipHeight ? activePoint.y + 18 : activePoint.y - tooltipHeight - 14, padding.top),
+            height - padding.bottom - tooltipHeight
+          )
+        : 0;
+
+      const getSvgXFromClient = (clientX, target) => {
+        const rect = target.getBoundingClientRect();
+        return ((clientX - rect.left) / rect.width) * width;
+      };
+
+      const getIndexFromSvgX = (svgX) => {
+        const xRatio = (svgX - padding.left) / innerWidth;
+        return view.start + xRatio * viewSpan;
+      };
+
+      const zoomView = (anchorIndex, scale) => {
+        if (!canZoom) return;
+
+        setViewWindow((currentWindow) => {
+          const currentView = clampViewWindow(currentWindow);
+          const currentSpan = Math.max(1, currentView.end - currentView.start);
+          const nextSpan = currentSpan * scale;
+          const anchorRatio = currentSpan > 0 ? (anchorIndex - currentView.start) / currentSpan : 0.5;
+          const boundedAnchorRatio = Math.min(1, Math.max(0, anchorRatio));
+          const nextStart = anchorIndex - nextSpan * boundedAnchorRatio;
+          return clampViewWindow({ start: nextStart, end: nextStart + nextSpan });
+        });
+      };
+
+      const panView = (indexDelta) => {
+        if (!isZoomed || !Number.isFinite(indexDelta) || indexDelta === 0) return;
+
+        setViewWindow((currentWindow) => {
+          const currentView = clampViewWindow(currentWindow);
+          return clampViewWindow({
+            start: currentView.start + indexDelta,
+            end: currentView.end + indexDelta,
+          });
+        });
+      };
+
+      const resetChartView = () => {
+        setViewWindow(getFullViewWindow());
+      };
+
+      const setNearestPoint = (clientX, target) => {
+        const svgX = getSvgXFromClient(clientX, target);
+        const candidates = visiblePoints.length ? visiblePoints : points;
+        const nearestPoint = candidates.reduce((nearest, point) =>
+          Math.abs(point.x - svgX) < Math.abs(nearest.x - svgX) ? point : nearest
+        );
+        setActivePointId(nearestPoint.id);
+      };
+
+      const handleWheel = (event) => {
+        if (!canZoom) return;
+
+        const target = event.currentTarget;
+        const isHorizontalScroll = Math.abs(event.deltaX) > 0 && Math.abs(event.deltaX) >= Math.abs(event.deltaY) * 0.7;
+
+        if (isHorizontalScroll) {
+          const panDelta = (event.deltaX / target.getBoundingClientRect().width) * viewSpan;
+          panView(panDelta);
+          return;
+        }
+
+        const svgX = Math.min(width - padding.right, Math.max(padding.left, getSvgXFromClient(event.clientX, target)));
+        const anchorIndex = getIndexFromSvgX(svgX);
+        zoomView(anchorIndex, event.deltaY > 0 ? 1.18 : 0.82);
+      };
+
+      const handlePointerDown = (event) => {
+        if (event.pointerType === 'mouse' && event.button !== 0) return;
+
+        interactionRef.current = {
+          pointerId: event.pointerId,
+          startClientX: event.clientX,
+          startView: view,
+          moved: false,
+        };
+        event.currentTarget.setPointerCapture && event.currentTarget.setPointerCapture(event.pointerId);
+      };
+
+      const handlePointerMove = (event) => {
+        const svg = event.currentTarget.ownerSVGElement || event.currentTarget;
+        const interaction = interactionRef.current;
+
+        if (!interaction || interaction.pointerId !== event.pointerId) {
+          setNearestPoint(event.clientX, svg);
+          return;
+        }
+
+        const movement = event.clientX - interaction.startClientX;
+        if (Math.abs(movement) > 2) interaction.moved = true;
+
+        if (!interaction.moved) {
+          setNearestPoint(event.clientX, svg);
+          return;
+        }
+
+        if (isZoomed) {
+          const svgDelta = (movement / svg.getBoundingClientRect().width) * width;
+          const indexDelta = -(svgDelta / innerWidth) * (interaction.startView.end - interaction.startView.start);
+          setViewWindow(clampViewWindow({
+            start: interaction.startView.start + indexDelta,
+            end: interaction.startView.end + indexDelta,
+          }));
+          setNearestPoint(event.clientX, svg);
+          return;
+        }
+      };
+
+      const handlePointerUp = (event) => {
+        const svg = event.currentTarget.ownerSVGElement || event.currentTarget;
+        event.currentTarget.releasePointerCapture && event.currentTarget.releasePointerCapture(event.pointerId);
+        setNearestPoint(event.clientX, svg);
+        interactionRef.current = null;
+      };
+
+      const handlePointerLeave = (event) => {
+        if (!interactionRef.current) {
+          setActivePointId(null);
+        }
+      };
+
+      return (
+        <div className={`${isFullscreen ? 'h-full' : ''} rounded-2xl border border-slate-200 bg-white p-4 shadow-sm`}>
+          <div className="mb-4 flex items-start justify-between gap-4">
+            <div>
+              <h3 className="text-base font-bold text-slate-800">区间趋势</h3>
+              <p className="mt-1 text-sm text-slate-500">当前展示 {rangeLabel} 的历史数据，滚轮或按钮缩放，放大后左右拖动查看。</p>
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <div className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+                共 {records.length} 条记录
+              </div>
+              <div className="inline-flex overflow-hidden rounded-lg border border-slate-200 bg-white">
+                <button
+                  type="button"
+                  onClick={() => zoomView((view.start + view.end) / 2, 0.72)}
+                  disabled={!canZoom}
+                  title="放大"
+                  aria-label="放大图表"
+                  className="inline-flex h-8 w-8 items-center justify-center text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:text-slate-300"
+                >
+                  <PlusIcon size={14} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => zoomView((view.start + view.end) / 2, 1.38)}
+                  disabled={!canZoom || !isZoomed}
+                  title="缩小"
+                  aria-label="缩小图表"
+                  className="inline-flex h-8 w-8 items-center justify-center border-l border-slate-200 text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:text-slate-300"
+                >
+                  <MinusIcon size={14} />
+                </button>
+                <button
+                  type="button"
+                  onClick={resetChartView}
+                  disabled={!isZoomed}
+                  title="重置视图"
+                  aria-label="重置图表视图"
+                  className="inline-flex h-8 w-8 items-center justify-center border-l border-slate-200 text-slate-600 transition hover:bg-slate-50 hover:text-slate-900 disabled:cursor-not-allowed disabled:text-slate-300"
+                >
+                  <RotateCcwIcon size={14} />
+                </button>
+              </div>
+              {isFullscreen ? (
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
+                >
+                  <XIcon size={14} />
+                  <span>退出全屏</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={onExpand}
+                  className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-blue-300 hover:text-blue-700"
+                >
+                  <ExpandIcon size={14} />
+                  <span>放大全屏</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {isFullscreen && rangeOptions.length ? (
+            <div className="mb-4 flex flex-wrap gap-2 border-b border-slate-100 pb-4">
+              {rangeOptions.map((option) => (
+                <button
+                  key={option.key}
+                  type="button"
+                  onClick={() => onRangeChange && onRangeChange(option.key)}
+                  className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                    activeRangeKey === option.key
+                      ? 'bg-slate-900 text-white'
+                      : 'border border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:text-slate-800'
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
+
+          {showSpxTrend ? (
+            <div className="mb-3 flex flex-wrap items-center gap-3 text-xs font-semibold text-slate-500">
+              <span className="inline-flex items-center gap-2 text-violet-700">
+                <span className="h-0.5 w-6 rounded-full bg-violet-400"></span>
+                SPX 背景趋势
+              </span>
+              <span>{shouldShowSpxTrend ? `当前区间 ${spxPoints.length} 条 SPX 点位` : '当前区间没有 SPX 点位'}</span>
+            </div>
+          ) : null}
+
+          <div className="pb-2">
+            <svg
+              viewBox={`0 0 ${width} ${height}`}
+              className={`${isFullscreen ? 'h-[70vh] min-h-[420px] w-full' : 'h-64 w-full'} select-none`}
+              onWheel={handleWheel}
+              onDoubleClick={resetChartView}
+            >
+              <defs>
+                <clipPath id={chartClipId}>
+                  <rect x={padding.left} y="0" width={innerWidth} height={height - padding.bottom + 8} />
+                </clipPath>
+              </defs>
+              {tickValues.map((tick) => {
+                const y = getY(tick);
+                return (
+                  <g key={tick}>
+                    <line
+                      x1={padding.left}
+                      y1={y}
+                      x2={width - padding.right}
+                      y2={y}
+                      stroke={tick === highThreshold ? '#dc2626' : '#16a34a'}
+                      strokeDasharray="6 4"
+                      strokeWidth="1.5"
+                      opacity="0.72"
+                    />
+                    <text
+                      x={padding.left - 10}
+                      y={y + 4}
+                      textAnchor="end"
+                      className={`${tick === highThreshold ? 'fill-red-600' : 'fill-green-600'} text-[10px] font-semibold`}
+                    >
+                      {tick}{TEMPERATURE_UNIT}
+                    </text>
+                    <text
+                      x={width - padding.right}
+                      y={y - 6}
+                      textAnchor="end"
+                      className={`${tick === highThreshold ? 'fill-red-600' : 'fill-green-600'} text-[10px] font-semibold`}
+                    >
+                      {tick === highThreshold ? '偏热线' : '偏冷线'}
+                    </text>
+                  </g>
+                );
+              })}
+
+              <g clipPath={`url(#${chartClipId})`}>
+                {spxLineSegments.map((segment) => (
+                  <line
+                    key={segment.key}
+                    x1={segment.x1}
+                    y1={segment.y1}
+                    x2={segment.x2}
+                    y2={segment.y2}
+                    stroke="#7c3aed"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeDasharray="8 6"
+                    opacity="0.42"
+                  />
+                ))}
+
+                {lineSegments.map((segment) => (
+                  <line
+                    key={segment.key}
+                    x1={segment.x1}
+                    y1={segment.y1}
+                    x2={segment.x2}
+                    y2={segment.y2}
+                    stroke={segment.stroke}
+                    strokeWidth="3"
+                    strokeLinecap="round"
+                  />
+                ))}
+              </g>
+
+              <line
+                x1={padding.left}
+                y1={height - padding.bottom}
+                x2={width - padding.right}
+                y2={height - padding.bottom}
+                stroke="#475569"
+                strokeWidth="1.25"
+              />
+
+              <g clipPath={`url(#${chartClipId})`}>
+              {points.map((point) => {
+                const pointTone = getTemperatureTone(point.temperature);
+                return (
+                  <g key={point.id}>
+                    <circle cx={point.x} cy={point.y} r={activePointId === point.id ? '13' : '10'} fill={activePointId === point.id ? 'rgba(15, 23, 42, 0.14)' : pointTone.halo} />
+                    <circle cx={point.x} cy={point.y} r={activePointId === point.id ? '6' : '5'} fill={activePointId === point.id ? '#0f172a' : pointTone.fill} />
+                    <title>{formatChartTooltip(point, timeZone)}</title>
+                    {showValues ? (
+                      <text x={point.x} y={point.y - 14} textAnchor="middle" className={`${pointTone.text} text-[10px] font-semibold`}>
+                        {formatTemperature(point.temperature)}
+                      </text>
+                    ) : null}
+                  </g>
+                );
+              })}
+              </g>
+
+              {points.map((point, index) => visibleDateLabelIndexes.has(index) ? (
+                <g key={`date-${point.id}`}>
+                  <line
+                    x1={point.x}
+                    y1={height - padding.bottom}
+                    x2={point.x}
+                    y2={height - padding.bottom + 5}
+                    stroke="#64748b"
+                    strokeWidth="1.25"
+                  />
+                  <text x={point.x} y={height - 12} textAnchor={getDateLabelAnchor(point.x)} className="fill-slate-700 text-[10px] font-semibold">
+                    {formatChartDate(point.timestamp, timeZone)}
+                  </text>
+                </g>
+              ) : null)}
+
+              {activePoint ? (
+                <g pointerEvents="none">
+                  <line
+                    x1={activePoint.x}
+                    y1={padding.top}
+                    x2={activePoint.x}
+                    y2={height - padding.bottom}
+                    stroke="#0f172a"
+                    strokeWidth="1.5"
+                    strokeDasharray="5 4"
+                    opacity="0.65"
+                  />
+                  <circle cx={activePoint.x} cy={activePoint.y} r="7" fill="#0f172a" />
+                  <circle cx={activePoint.x} cy={activePoint.y} r="14" fill="rgba(15, 23, 42, 0.16)" />
+                  <g transform={`translate(${tooltipX} ${tooltipY})`}>
+                    <rect width={tooltipWidth} height={tooltipHeight} rx="8" fill="#0f172a" opacity="0.94" />
+                    <text x="12" y="18" className="fill-white text-[11px] font-semibold">
+                      {formatRecordDate(activePoint.timestamp, timeZone)}
+                    </text>
+                    <text x="12" y="37" className="fill-blue-100 text-[13px] font-bold">
+                      {formatTemperature(activePoint.temperature)}
+                    </text>
+                    {hasSpxValue(activePoint) ? (
+                      <text x="12" y="54" className="fill-violet-100 text-[10px] font-semibold">
+                        SPX {formatSpxValue(activePoint.spxValue)}
+                      </text>
+                    ) : null}
+                    <text x="12" y={hasSpxValue(activePoint) ? '70' : '54'} className="fill-slate-300 text-[10px]">
+                      {isManualRecord(activePoint) ? '手动温度' : `总家数 ${activePoint.totalCount.toFixed(0)}`}
+                    </text>
+                  </g>
+                </g>
+              ) : null}
+
+              <rect
+                x={padding.left}
+                y={padding.top}
+                width={innerWidth}
+                height={innerHeight}
+                fill="transparent"
+                style={{ cursor: isZoomed ? 'grab' : 'crosshair', touchAction: 'none' }}
+                onPointerDown={handlePointerDown}
+                onPointerMove={handlePointerMove}
+                onPointerUp={handlePointerUp}
+                onPointerCancel={handlePointerUp}
+                onPointerLeave={handlePointerLeave}
+              />
+            </svg>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [activeToolTab, setActiveToolTab] = useState('temperature');
+      const [inputMode, setInputMode] = useState(INPUT_MODES.counts);
+      const [upCount, setUpCount] = useState('');
+      const [downCount, setDownCount] = useState('');
+      const [flatCount, setFlatCount] = useState('');
+      const [manualTemperature, setManualTemperature] = useState('');
+      const [spxValue, setSpxValue] = useState('');
+      const [manualRecordTime, setManualRecordTime] = useState(() => formatDateTimeLocalValue(Date.now(), loadTimeZonePreference()));
+      const [historyRecords, setHistoryRecords] = useState(loadHistoryRecords);
+      const [autoSaveEnabled, setAutoSaveEnabled] = useState(loadAutoSavePreference);
+      const [selectedTimeZone, setSelectedTimeZone] = useState(loadTimeZonePreference);
+      const [showChartValues, setShowChartValues] = useState(loadShowChartValuesPreference);
+      const [showSpxTrend, setShowSpxTrend] = useState(loadShowSpxTrendPreference);
+      const spxApiKey = DEFAULT_SPX_API_KEY;
+      const [feedback, setFeedback] = useState(null);
+      const [statsRange, setStatsRange] = useState('20');
+      const [editingRecordId, setEditingRecordId] = useState(null);
+      const [bulkModeEnabled, setBulkModeEnabled] = useState(false);
+      const [selectedRecordIds, setSelectedRecordIds] = useState([]);
+      const [bulkEditingEnabled, setBulkEditingEnabled] = useState(false);
+      const [dataMenuOpen, setDataMenuOpen] = useState(false);
+      const [historyDateFilter, setHistoryDateFilter] = useState('');
+      const [chartFullscreenOpen, setChartFullscreenOpen] = useState(false);
+      const [spxRangeFetchLoading, setSpxRangeFetchLoading] = useState(false);
+      const [editForm, setEditForm] = useState({
+        timestamp: '',
+        inputMode: INPUT_MODES.counts,
+        upCount: '',
+        downCount: '',
+        flatCount: '',
+        manualTemperature: '',
+        spxValue: '',
+      });
+      const [bulkEditForms, setBulkEditForms] = useState({});
+
+      const historyRef = useRef(historyRecords);
+      const lastAutoSavedSignatureRef = useRef('');
+      const jsonImportInputRef = useRef(null);
+
+      const upValue = safeNumber(upCount);
+      const downValue = safeNumber(downCount);
+      const flatValue = safeNumber(flatCount);
+      const manualTemperatureValue = safeNumber(manualTemperature);
+      const spxInputValue = safeNumber(spxValue);
+      const hasValidSpxInput = spxValue === '' || spxInputValue > 0;
+      const isManualInputMode = inputMode === INPUT_MODES.manual;
+      const manualRecordTimestamp = isManualInputMode
+        ? parseDateTimeInTimeZone(manualRecordTime, selectedTimeZone)
+        : Date.now();
+      const totalCount = upValue + downValue + flatValue;
+      const hasAnyInput = isManualInputMode
+        ? manualTemperature !== ''
+        : upCount !== '' || downCount !== '' || flatCount !== '';
+      const hasValidTemperatureInput = isManualInputMode
+        ? manualTemperature !== '' && manualTemperatureValue >= 0 && manualTemperatureValue <= 100 && Number.isFinite(manualRecordTimestamp)
+        : totalCount > 0;
+      const hasValidInput = hasValidTemperatureInput && hasValidSpxInput;
+      const temperature = isManualInputMode
+        ? (hasValidTemperatureInput ? manualTemperatureValue : 0)
+        : (hasValidTemperatureInput ? (upValue / totalCount) * 100 : 0);
+      const activeRangeOption = RANGE_OPTIONS.find((option) => option.key === statsRange) || RANGE_OPTIONS[1];
+      const statsRecords = filterRecordsByRange(historyRecords, activeRangeOption, selectedTimeZone);
+      const visibleHistoryRecords = historyDateFilter
+        ? historyRecords.filter((record) => formatRecordDateFilterValue(record.timestamp, selectedTimeZone) === historyDateFilter)
+        : historyRecords;
+      const visibleRecordIds = visibleHistoryRecords.map((record) => record.id);
+      const selectedVisibleCount = selectedRecordIds.filter((id) => visibleRecordIds.includes(id)).length;
+      const allVisibleRecordsSelected = visibleRecordIds.length > 0 && selectedVisibleCount === visibleRecordIds.length;
+      const selectedCount = selectedRecordIds.length;
+
+      useEffect(() => {
+        historyRef.current = historyRecords;
+        try {
+          window.localStorage.setItem(STORAGE_KEYS.history, JSON.stringify(historyRecords));
+        } catch (error) {
+          // 忽略 localStorage 异常，避免影响主要计算流程。
+        }
+      }, [historyRecords]);
+
+      useEffect(() => {
+        try {
+          window.localStorage.setItem(STORAGE_KEYS.autoSave, String(autoSaveEnabled));
+        } catch (error) {
+          // 忽略 localStorage 异常，避免影响主要计算流程。
+        }
+      }, [autoSaveEnabled]);
+
+      useEffect(() => {
+        try {
+          window.localStorage.setItem(STORAGE_KEYS.timeZone, selectedTimeZone);
+        } catch (error) {
+          // 忽略 localStorage 异常，避免影响主要计算流程。
+        }
+      }, [selectedTimeZone]);
+
+      useEffect(() => {
+        try {
+          window.localStorage.setItem(STORAGE_KEYS.showChartValues, String(showChartValues));
+        } catch (error) {
+          // 忽略 localStorage 异常，避免影响主要计算流程。
+        }
+      }, [showChartValues]);
+
+      useEffect(() => {
+        try {
+          window.localStorage.setItem(STORAGE_KEYS.showSpxTrend, String(showSpxTrend));
+        } catch (error) {
+          // 忽略 localStorage 异常，避免影响主要计算流程。
+        }
+      }, [showSpxTrend]);
+
+      useEffect(() => {
+        if (!feedback) return undefined;
+
+        const timeoutId = window.setTimeout(() => setFeedback(null), 2600);
+        return () => window.clearTimeout(timeoutId);
+      }, [feedback]);
+
+      useEffect(() => {
+        if (!chartFullscreenOpen) return undefined;
+
+        const handleKeyDown = (event) => {
+          if (event.key === 'Escape') {
+            setChartFullscreenOpen(false);
+          }
+        };
+
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+      }, [chartFullscreenOpen]);
+
+      useEffect(() => {
+        setSelectedRecordIds((current) => current.filter((id) => historyRecords.some((record) => record.id === id)));
+      }, [historyRecords]);
+
+      useEffect(() => {
+        if (!autoSaveEnabled || !hasValidInput) return undefined;
+
+        const record = createCurrentRecord();
+        const signature = getRecordSignature(record);
+        const latestRecord = historyRef.current[0];
+        const latestSignature = latestRecord ? getRecordSignature(latestRecord) : '';
+
+        if (signature === latestSignature || signature === lastAutoSavedSignatureRef.current) {
+          lastAutoSavedSignatureRef.current = signature;
+          return undefined;
+        }
+
+        setHistoryRecords([record, ...historyRef.current]);
+        lastAutoSavedSignatureRef.current = signature;
+        setFeedback({ tone: 'success', text: '已自动保存最新记录。' });
+        return undefined;
+      }, [autoSaveEnabled, inputMode, upCount, downCount, flatCount, manualTemperature, spxValue, manualRecordTime, hasValidInput, temperature]);
+
+      const getTemperatureColor = (temp) => {
+        if (temp > 60) return 'bg-red-600';
+        if (temp < 20) return 'bg-green-600';
+        return 'bg-slate-950';
+      };
+
+      const getTemperatureText = (temp) => {
+        if (!hasAnyInput) return '请输入数据';
+        if (temp > 60) return '市场偏热（多头强势）';
+        if (temp < 20) return '市场偏冷（空头强势）';
+        return '市场中性（20°-60°）';
+      };
+
+      const createCurrentRecord = () => {
+        const timestamp = isManualInputMode ? manualRecordTimestamp : Date.now();
+        const roundedTemperature = Number(temperature.toFixed(2));
+        const recordMode = isManualInputMode ? INPUT_MODES.manual : INPUT_MODES.counts;
+        return {
+          id: `${timestamp}-${Math.random().toString(16).slice(2, 8)}`,
+          timestamp,
+          inputMode: recordMode,
+          dateLabel: formatRecordDate(timestamp, selectedTimeZone),
+          upCount: recordMode === INPUT_MODES.counts ? upValue : 0,
+          downCount: recordMode === INPUT_MODES.counts ? downValue : 0,
+          flatCount: recordMode === INPUT_MODES.counts ? flatValue : 0,
+          totalCount: recordMode === INPUT_MODES.counts ? totalCount : 0,
+          temperature: roundedTemperature,
+          spxValue: spxValue === '' ? null : Number(spxInputValue.toFixed(2)),
+        };
+      };
+
+      const saveCurrentRecord = (source) => {
+        if (!hasValidInput) {
+          setFeedback({ tone: 'error', text: !hasValidSpxInput ? 'SPX 点位需为空或大于 0。' : (isManualInputMode ? '请输入有效日期，以及 0 到 100 之间的温度。' : '请先输入有效数据，再保存记录。') });
+          return;
+        }
+
+        const latestRecord = historyRef.current[0];
+        const record = createCurrentRecord();
+        const signature = getRecordSignature(record);
+        const latestSignature = latestRecord ? getRecordSignature(latestRecord) : '';
+
+        if (signature === latestSignature) {
+          lastAutoSavedSignatureRef.current = signature;
+          setFeedback({ tone: 'info', text: '当前数据和最新一条相同，已跳过重复保存。' });
+          return;
+        }
+
+        setHistoryRecords([record, ...historyRef.current]);
+        if (source === 'manual') {
+          setSpxValue('');
+        }
+        lastAutoSavedSignatureRef.current = signature;
+        setFeedback({
+          tone: 'success',
+          text: source === 'manual' ? '已保存本次记录。' : '已自动保存最新记录。',
+        });
+      };
+
+      const refreshSpxForCurrentRange = async () => {
+        if (!statsRecords.length) {
+          setFeedback({ tone: 'info', text: '当前区间没有历史记录可刷新 SPX。' });
+          return;
+        }
+        const missingSpxRecords = statsRecords.filter((record) => !hasSpxValue(record));
+        if (!missingSpxRecords.length) {
+          setFeedback({ tone: 'info', text: '当前区间的历史记录都已有 SPX 数据，未消耗 API call。' });
+          return;
+        }
+
+        setSpxRangeFetchLoading(true);
+        const updates = {};
+        let successCount = 0;
+        let failureCount = 0;
+        let firstErrorMessage = '';
+
+        try {
+          const marketDates = missingSpxRecords.map((record) =>
+            formatRecordDateFilterValue(record.timestamp, SPX_MARKET_TIME_ZONE)
+          );
+          const startDate = shiftDateInputValue(marketDates.reduce((earliest, date) => date < earliest ? date : earliest), -7);
+          const endDate = shiftDateInputValue(marketDates.reduce((latest, date) => date > latest ? date : latest), 2);
+          const rows = await fetchSpxRowsForDateRange(startDate, endDate, spxApiKey);
+
+          missingSpxRecords.forEach((record) => {
+            const marketDate = formatRecordDateFilterValue(record.timestamp, SPX_MARKET_TIME_ZONE);
+            const result = pickSpxCloseForMarketDate(rows, marketDate);
+            updates[record.id] = result.value;
+            successCount += 1;
+          });
+        } catch (error) {
+          failureCount = missingSpxRecords.length;
+          firstErrorMessage = error.message || 'SPX 联网刷新失败。';
+        }
+
+        if (successCount) {
+          setHistoryRecords((current) =>
+            current
+              .map((record) =>
+                Object.prototype.hasOwnProperty.call(updates, record.id)
+                  ? { ...record, spxValue: updates[record.id] }
+                  : record
+              )
+              .sort((a, b) => b.timestamp - a.timestamp)
+          );
+        }
+
+        setSpxRangeFetchLoading(false);
+        if (failureCount && successCount) {
+          setFeedback({ tone: 'info', text: `已刷新 ${successCount} 条 SPX，${failureCount} 条失败：${firstErrorMessage}` });
+        } else if (successCount) {
+          setFeedback({ tone: 'success', text: `已用 1 次 API call 补齐当前区间 ${successCount} 条历史记录的 SPX。` });
+        } else {
+          setFeedback({ tone: 'error', text: firstErrorMessage || 'SPX 联网刷新失败，请稍后重试。' });
+        }
+      };
+
+      const handleFocus = (event) => event.target.select();
+
+      const beginEditRecord = (record) => {
+        setEditingRecordId(record.id);
+        setEditForm({
+          timestamp: formatDateTimeLocalValue(record.timestamp, selectedTimeZone),
+          inputMode: record.inputMode || INPUT_MODES.counts,
+          upCount: String(record.upCount),
+          downCount: String(record.downCount),
+          flatCount: String(record.flatCount),
+          manualTemperature: String(record.temperature),
+          spxValue: hasSpxValue(record) ? String(record.spxValue) : '',
+        });
+      };
+
+      const cancelEditRecord = () => {
+        setEditingRecordId(null);
+        setEditForm({
+          timestamp: '',
+          inputMode: INPUT_MODES.counts,
+          upCount: '',
+          downCount: '',
+          flatCount: '',
+          manualTemperature: '',
+          spxValue: '',
+        });
+      };
+
+      const toggleRecordSelection = (recordId) => {
+        setSelectedRecordIds((current) =>
+          current.includes(recordId)
+            ? current.filter((id) => id !== recordId)
+            : [...current, recordId]
+        );
+      };
+
+      const toggleSelectAllRecords = () => {
+        if (!visibleRecordIds.length) {
+          setFeedback({ tone: 'info', text: '当前筛选日期下没有可选择的历史记录。' });
+          return;
+        }
+
+        if (allVisibleRecordsSelected) {
+          const visibleSet = new Set(visibleRecordIds);
+          setSelectedRecordIds((current) => current.filter((id) => !visibleSet.has(id)));
+          cancelBulkEdit();
+          return;
+        }
+        setSelectedRecordIds((current) => Array.from(new Set([...current, ...visibleRecordIds])));
+      };
+
+      const beginBulkEdit = () => {
+        if (!selectedRecordIds.length) {
+          setFeedback({ tone: 'info', text: '请先勾选要批量编辑的历史记录。' });
+          return;
+        }
+
+        const forms = {};
+        historyRecords.forEach((record) => {
+          if (!selectedRecordIds.includes(record.id)) return;
+          forms[record.id] = {
+            timestamp: formatDateTimeLocalValue(record.timestamp, selectedTimeZone),
+            inputMode: record.inputMode || INPUT_MODES.counts,
+            upCount: String(record.upCount),
+            downCount: String(record.downCount),
+            flatCount: String(record.flatCount),
+            manualTemperature: String(record.temperature),
+            spxValue: hasSpxValue(record) ? String(record.spxValue) : '',
+          };
+        });
+        setBulkEditForms(forms);
+        setBulkEditingEnabled(true);
+        cancelEditRecord();
+      };
+
+      const cancelBulkEdit = () => {
+        setBulkEditingEnabled(false);
+        setBulkEditForms({});
+      };
+
+      const closeBulkMode = () => {
+        setBulkModeEnabled(false);
+        setSelectedRecordIds([]);
+        cancelBulkEdit();
+      };
+
+      const handleBulkEditChange = (recordId, field, value) => {
+        setBulkEditForms((current) => ({
+          ...current,
+          [recordId]: {
+            ...current[recordId],
+            [field]: value,
+          },
+        }));
+      };
+
+      const handleEditFormChange = (field, value) => {
+        setEditForm((current) => ({ ...current, [field]: value }));
+      };
+
+      const saveEditedRecord = (recordId) => {
+        const parsedTimestamp = parseDateTimeInTimeZone(editForm.timestamp, selectedTimeZone);
+        const nextInputMode = editForm.inputMode === INPUT_MODES.manual ? INPUT_MODES.manual : INPUT_MODES.counts;
+        const nextUpCount = safeNumber(editForm.upCount);
+        const nextDownCount = safeNumber(editForm.downCount);
+        const nextFlatCount = safeNumber(editForm.flatCount);
+        const nextTotalCount = nextUpCount + nextDownCount + nextFlatCount;
+        const nextManualTemperature = safeNumber(editForm.manualTemperature);
+        const nextSpxValue = safeNumber(editForm.spxValue);
+
+        if (!Number.isFinite(parsedTimestamp)) {
+          setFeedback({ tone: 'error', text: '请填写有效的记录时间。' });
+          return;
+        }
+
+        if (nextInputMode === INPUT_MODES.counts && nextTotalCount <= 0) {
+          setFeedback({ tone: 'error', text: '请填写有效的涨跌平家数。' });
+          return;
+        }
+
+        if (nextInputMode === INPUT_MODES.manual && (editForm.manualTemperature === '' || nextManualTemperature < 0 || nextManualTemperature > 100)) {
+          setFeedback({ tone: 'error', text: '请填写 0 到 100 之间的有效温度。' });
+          return;
+        }
+
+        if (editForm.spxValue !== '' && nextSpxValue <= 0) {
+          setFeedback({ tone: 'error', text: 'SPX 点位需为空或大于 0。' });
+          return;
+        }
+
+        const nextTemperature = nextInputMode === INPUT_MODES.manual
+          ? Number(nextManualTemperature.toFixed(2))
+          : Number(((nextUpCount / nextTotalCount) * 100).toFixed(2));
+
+        setHistoryRecords((current) =>
+          current
+            .map((record) =>
+              record.id === recordId
+                ? {
+                    ...record,
+                    timestamp: parsedTimestamp,
+                    inputMode: nextInputMode,
+                    dateLabel: formatRecordDate(parsedTimestamp, selectedTimeZone),
+                    upCount: nextInputMode === INPUT_MODES.counts ? nextUpCount : 0,
+                    downCount: nextInputMode === INPUT_MODES.counts ? nextDownCount : 0,
+                    flatCount: nextInputMode === INPUT_MODES.counts ? nextFlatCount : 0,
+                    totalCount: nextInputMode === INPUT_MODES.counts ? nextTotalCount : 0,
+                    temperature: nextTemperature,
+                    spxValue: editForm.spxValue === '' ? null : Number(nextSpxValue.toFixed(2)),
+                  }
+                : record
+            )
+            .sort((a, b) => b.timestamp - a.timestamp)
+        );
+        cancelEditRecord();
+        setFeedback({ tone: 'success', text: '历史记录已更新。' });
+      };
+
+      const deleteRecord = (recordId) => {
+        const shouldDelete = window.confirm('确定要删除这条历史记录吗？');
+        if (!shouldDelete) return;
+
+        setHistoryRecords((current) => current.filter((record) => record.id !== recordId));
+        if (editingRecordId === recordId) {
+          cancelEditRecord();
+        }
+        setFeedback({ tone: 'success', text: '已删除选中的历史记录。' });
+      };
+
+      const saveBulkEditedRecords = () => {
+        if (!selectedRecordIds.length) {
+          setFeedback({ tone: 'info', text: '当前没有选中的历史记录。' });
+          return;
+        }
+
+        const updates = {};
+        for (const recordId of selectedRecordIds) {
+          const form = bulkEditForms[recordId];
+          if (!form) continue;
+
+          const parsedTimestamp = parseDateTimeInTimeZone(form.timestamp, selectedTimeZone);
+          const nextInputMode = form.inputMode === INPUT_MODES.manual ? INPUT_MODES.manual : INPUT_MODES.counts;
+          const nextUpCount = safeNumber(form.upCount);
+          const nextDownCount = safeNumber(form.downCount);
+          const nextFlatCount = safeNumber(form.flatCount);
+          const nextTotalCount = nextUpCount + nextDownCount + nextFlatCount;
+          const nextManualTemperature = safeNumber(form.manualTemperature);
+          const nextSpxValue = safeNumber(form.spxValue);
+
+          if (!Number.isFinite(parsedTimestamp)) {
+            setFeedback({ tone: 'error', text: '批量编辑中有无效时间，请检查后再保存。' });
+            return;
+          }
+
+          if (nextInputMode === INPUT_MODES.counts && nextTotalCount <= 0) {
+            setFeedback({ tone: 'error', text: '批量编辑中有无效涨跌平家数，请检查后再保存。' });
+            return;
+          }
+
+          if (nextInputMode === INPUT_MODES.manual && (form.manualTemperature === '' || nextManualTemperature < 0 || nextManualTemperature > 100)) {
+            setFeedback({ tone: 'error', text: '批量编辑中有无效温度，请填写 0 到 100。' });
+            return;
+          }
+
+          if (form.spxValue !== '' && nextSpxValue <= 0) {
+            setFeedback({ tone: 'error', text: '批量编辑中有无效 SPX 点位，请留空或填写大于 0 的数值。' });
+            return;
+          }
+
+          updates[recordId] = {
+            timestamp: parsedTimestamp,
+            inputMode: nextInputMode,
+            dateLabel: formatRecordDate(parsedTimestamp, selectedTimeZone),
+            upCount: nextInputMode === INPUT_MODES.counts ? nextUpCount : 0,
+            downCount: nextInputMode === INPUT_MODES.counts ? nextDownCount : 0,
+            flatCount: nextInputMode === INPUT_MODES.counts ? nextFlatCount : 0,
+            totalCount: nextInputMode === INPUT_MODES.counts ? nextTotalCount : 0,
+            temperature: nextInputMode === INPUT_MODES.manual
+              ? Number(nextManualTemperature.toFixed(2))
+              : Number(((nextUpCount / nextTotalCount) * 100).toFixed(2)),
+            spxValue: form.spxValue === '' ? null : Number(nextSpxValue.toFixed(2)),
+          };
+        }
+
+        setHistoryRecords((current) =>
+          current
+            .map((record) => (updates[record.id] ? { ...record, ...updates[record.id] } : record))
+            .sort((a, b) => b.timestamp - a.timestamp)
+        );
+        cancelBulkEdit();
+        setFeedback({ tone: 'success', text: `已批量更新 ${selectedRecordIds.length} 条历史记录。` });
+      };
+
+      const deleteSelectedRecords = () => {
+        if (!selectedRecordIds.length) {
+          setFeedback({ tone: 'info', text: '请先勾选要删除的历史记录。' });
+          return;
+        }
+
+        const shouldDelete = window.confirm(`确定要删除选中的 ${selectedRecordIds.length} 条历史记录吗？`);
+        if (!shouldDelete) return;
+
+        const selectedSet = new Set(selectedRecordIds);
+        setHistoryRecords((current) => current.filter((record) => !selectedSet.has(record.id)));
+        setSelectedRecordIds([]);
+        cancelBulkEdit();
+        if (editingRecordId && selectedSet.has(editingRecordId)) {
+          cancelEditRecord();
+        }
+        setFeedback({ tone: 'success', text: `已删除 ${selectedSet.size} 条历史记录。` });
+      };
+
+      const handleExportCsv = () => {
+        if (!historyRef.current.length) {
+          setFeedback({ tone: 'info', text: '还没有历史记录可以导出。' });
+          return;
+        }
+
+        const rows = [
+          ['日期时间', '记录来源', '上涨家数', '下跌家数', '平盘家数', '总家数', '计数温度(°)', 'SPX点位'],
+          ...historyRef.current
+            .slice()
+            .reverse()
+            .map((record) => [
+              formatRecordDate(record.timestamp, selectedTimeZone),
+              isManualRecord(record) ? '手动温度' : '涨跌家数',
+              isManualRecord(record) ? '' : record.upCount,
+              isManualRecord(record) ? '' : record.downCount,
+              isManualRecord(record) ? '' : record.flatCount,
+              isManualRecord(record) ? '' : record.totalCount,
+              record.temperature.toFixed(2),
+              hasSpxValue(record) ? record.spxValue.toFixed(2) : '',
+            ]),
+        ];
+
+        const csvContent = `\uFEFF${rows.map((row) => row.map(escapeCsvValue).join(',')).join('\r\n')}`;
+        const dateStamp = formatFileDate();
+        downloadTextFile(csvContent, `market-temperature-history-${dateStamp}.csv`, 'text/csv;charset=utf-8;');
+        setDataMenuOpen(false);
+        setFeedback({ tone: 'success', text: 'CSV 已导出，可用表格软件继续分析。' });
+      };
+
+      const handleExportJson = () => {
+        const backup = {
+          app: 'market-temperature-calculator',
+          schemaVersion: CURRENT_DATA_SCHEMA_VERSION,
+          exportedAt: new Date().toISOString(),
+          preferences: {
+            autoSaveEnabled,
+            selectedTimeZone,
+            showChartValues,
+            showSpxTrend,
+          },
+          records: normalizeHistoryRecords(historyRef.current),
+        };
+
+        const dateStamp = formatFileDate();
+        downloadTextFile(
+          JSON.stringify(backup, null, 2),
+          `market-temperature-backup-${dateStamp}.json`,
+          'application/json;charset=utf-8;'
+        );
+        setDataMenuOpen(false);
+        setFeedback({ tone: 'success', text: `JSON 备份已导出，共 ${backup.records.length} 条记录。` });
+      };
+
+      const handleImportJsonClick = () => {
+        if (jsonImportInputRef.current) {
+          jsonImportInputRef.current.value = '';
+          jsonImportInputRef.current.click();
+        }
+      };
+
+      const handleImportJson = (event) => {
+        const file = event.target.files && event.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const parsed = JSON.parse(String(reader.result || ''));
+            const rawRecords = Array.isArray(parsed) ? parsed : parsed.records;
+            const normalizedRecords = normalizeHistoryRecords(rawRecords);
+
+            if (!normalizedRecords.length) {
+              setFeedback({ tone: 'error', text: '没有在 JSON 文件中找到可导入的历史记录。' });
+              return;
+            }
+
+            if (historyRef.current.length) {
+              const shouldReplace = window.confirm(
+                `导入会替换当前 ${historyRef.current.length} 条历史记录。确定继续吗？`
+              );
+              if (!shouldReplace) {
+                setFeedback({ tone: 'info', text: '已取消 JSON 导入。' });
+                return;
+              }
+            }
+
+            setHistoryRecords(normalizedRecords);
+            lastAutoSavedSignatureRef.current = '';
+            cancelEditRecord();
+            closeBulkMode();
+
+            if (parsed && parsed.preferences && typeof parsed.preferences === 'object') {
+              if (typeof parsed.preferences.autoSaveEnabled === 'boolean') {
+                setAutoSaveEnabled(parsed.preferences.autoSaveEnabled);
+              }
+              if (typeof parsed.preferences.selectedTimeZone === 'string') {
+                setSelectedTimeZone(getValidTimeZone(parsed.preferences.selectedTimeZone));
+              }
+              if (typeof parsed.preferences.showChartValues === 'boolean') {
+                setShowChartValues(parsed.preferences.showChartValues);
+              }
+              if (typeof parsed.preferences.showSpxTrend === 'boolean') {
+                setShowSpxTrend(parsed.preferences.showSpxTrend);
+              }
+            }
+
+            try {
+              window.localStorage.setItem(STORAGE_KEYS.schemaVersion, String(CURRENT_DATA_SCHEMA_VERSION));
+            } catch (error) {
+              // 忽略 localStorage 异常，避免影响导入后的页面状态。
+            }
+
+            setFeedback({ tone: 'success', text: `JSON 已导入，共 ${normalizedRecords.length} 条记录。` });
+            setDataMenuOpen(false);
+          } catch (error) {
+            setFeedback({ tone: 'error', text: 'JSON 文件格式无效，导入失败。' });
+          }
+        };
+        reader.onerror = () => {
+          setFeedback({ tone: 'error', text: '读取 JSON 文件失败，请重新选择文件。' });
+        };
+        reader.readAsText(file);
+      };
+
+      const handleClearHistory = () => {
+        if (!historyRef.current.length) {
+          setFeedback({ tone: 'info', text: '目前没有可清空的历史记录。' });
+          return;
+        }
+
+        const shouldClear = window.confirm('确定要清空所有历史记录吗？这个动作无法恢复。');
+        if (!shouldClear) return;
+
+        setHistoryRecords([]);
+        lastAutoSavedSignatureRef.current = '';
+        cancelEditRecord();
+        closeBulkMode();
+        setDataMenuOpen(false);
+        setFeedback({ tone: 'success', text: '历史记录已清空。' });
+      };
+
+      const stats = statsRecords.length
+        ? {
+            latest: statsRecords[0].temperature,
+            highest: statsRecords.reduce((max, record) => Math.max(max, record.temperature), statsRecords[0].temperature),
+            lowest: statsRecords.reduce((min, record) => Math.min(min, record.temperature), statsRecords[0].temperature),
+            average:
+              statsRecords.reduce((sum, record) => sum + record.temperature, 0) / statsRecords.length,
+          }
+        : null;
+
+      const feedbackClassMap = {
+        success: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+        error: 'border-red-200 bg-red-50 text-red-700',
+        info: 'border-blue-200 bg-blue-50 text-blue-700',
+      };
+
+      const renderToolTabs = () => (
+        <div className="mx-auto mb-6 max-w-6xl">
+          <div className="grid gap-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-sm sm:grid-cols-3">
+            <button
+              type="button"
+              onClick={() => setActiveToolTab('temperature')}
+              className={`inline-flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-bold transition ${
+                activeToolTab === 'temperature'
+                  ? 'bg-slate-900 text-white shadow-sm'
+                  : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+              }`}
+            >
+              <ThermometerIcon size={18} />
+              <span>温度计算器</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveToolTab('priceTarget')}
+              className={`inline-flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-bold transition ${
+                activeToolTab === 'priceTarget'
+                  ? 'bg-slate-900 text-white shadow-sm'
+                  : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+              }`}
+            >
+              <TargetIcon size={18} />
+              <span>回撤/反弹计算器</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveToolTab('kLine')}
+              className={`inline-flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-bold transition ${
+                activeToolTab === 'kLine'
+                  ? 'bg-slate-900 text-white shadow-sm'
+                  : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+              }`}
+            >
+              <CandlestickIcon size={18} />
+              <span>K线次日高低点</span>
+            </button>
+          </div>
+        </div>
+      );
+
+      if (activeToolTab === 'kLine') {
+        return (
+          <div className="min-h-screen bg-slate-50 px-4 py-6 font-sans text-slate-800 lg:px-6">
+            {renderToolTabs()}
+            <KLineNextDayCalculator />
+          </div>
+        );
+      }
+
+      if (activeToolTab === 'priceTarget') {
+        return (
+          <div className="min-h-screen bg-slate-50 px-4 py-6 font-sans text-slate-800 lg:px-6">
+            {renderToolTabs()}
+            <PriceTargetCalculator />
+          </div>
+        );
+      }
+
+      return (
+        <div className="min-h-screen bg-slate-50 px-4 py-6 font-sans text-slate-800 lg:px-6">
+          {renderToolTabs()}
+          <div className="mx-auto grid max-w-6xl gap-6 lg:grid-cols-[420px_minmax(0,1fr)]">
+            <div className="overflow-hidden rounded-3xl border border-slate-100 bg-white shadow-xl">
+                <div className="bg-slate-800 p-6 text-center text-white">
+                  <div className="mb-3 flex justify-center">
+                    <ActivityIcon size={40} className="text-blue-400" />
+                  </div>
+                <h1 className="text-2xl font-bold tracking-wider">计数温度计算器</h1>
+                <p className="mt-2 text-sm text-slate-400 opacity-80">
+                  公式：上涨家数 ÷（上涨 + 下跌 + 平盘）× 100，也可直接记录历史温度
+                </p>
+              </div>
+
+              <div className="space-y-6 p-6">
+                <div className="grid gap-3">
+                  <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setInputMode(INPUT_MODES.counts);
+                        setSpxValue('');
+                      }}
+                      className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                        inputMode === INPUT_MODES.counts
+                          ? 'bg-white text-slate-900 shadow-sm'
+                          : 'text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      涨跌家数
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setInputMode(INPUT_MODES.manual);
+                        setSpxValue('');
+                      }}
+                      className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                        inputMode === INPUT_MODES.manual
+                          ? 'bg-white text-slate-900 shadow-sm'
+                          : 'text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      手动温度
+                    </button>
+                  </div>
+
+                  <label className="block">
+                    <span className="mb-1 block text-sm font-medium text-slate-600">显示时区</span>
+                    <select
+                      value={selectedTimeZone}
+                      onChange={(event) => setSelectedTimeZone(getValidTimeZone(event.target.value))}
+                      className="w-full rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                    >
+                      {TIME_ZONE_OPTIONS.map((option) => (
+                        <option key={option.key} value={option.key}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+
+                </div>
+
+                <div className="space-y-4">
+                  {isManualInputMode ? (
+                    <div className="space-y-4">
+                      <div className="flex items-center space-x-4">
+                        <div className="rounded-lg bg-slate-100 p-3 text-slate-600">
+                          <HistoryIcon size={24} />
+                        </div>
+                        <div className="flex-1">
+                          <label className="mb-1 block text-sm font-medium text-slate-600">记录日期</label>
+                          <input
+                            type="datetime-local"
+                            value={manualRecordTime}
+                            onChange={(event) => {
+                              setManualRecordTime(event.target.value);
+                              setSpxValue('');
+                            }}
+                            className="w-full rounded-lg border border-slate-200 bg-white px-4 py-2 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-400"
+                          />
+                          <div className="mt-1 text-xs text-slate-500">按当前选择的时区保存。</div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center space-x-4">
+                        <div className="rounded-lg bg-blue-50 p-3 text-blue-600">
+                          <ThermometerIcon size={24} />
+                        </div>
+                        <div className="flex-1">
+                          <label className="mb-1 block text-sm font-medium text-slate-600">历史温度</label>
+                          <input
+                            type="number"
+                            min="0"
+                            max="100"
+                            step="0.01"
+                            value={manualTemperature}
+                            onChange={(event) => setManualTemperature(event.target.value)}
+                            onFocus={handleFocus}
+                            placeholder="0-100"
+                            className="w-full rounded-lg border border-slate-200 bg-white px-4 py-2 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-400"
+                          />
+                          <div className="mt-1 text-xs text-slate-500">适合只知道过去温度、不知道当日涨跌家数的记录。</div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center space-x-4">
+                        <div className="rounded-lg bg-violet-50 p-3 text-violet-600">
+                          <ChartIcon size={24} />
+                        </div>
+                        <div className="flex-1">
+                          <label className="mb-1 block text-sm font-medium text-slate-600">SPX 指数点位（可选）</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={spxValue}
+                            onChange={(event) => setSpxValue(event.target.value)}
+                            onFocus={handleFocus}
+                            placeholder="例如 5100.25"
+                            className="w-full rounded-lg border border-slate-200 bg-white px-4 py-2 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
+                          />
+                          <div className="mt-1 text-xs text-slate-500">手动补录历史温度时，可同时保存当日 SPX 点位。</div>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-center space-x-4">
+                        <div className="rounded-lg bg-red-50 p-3 text-red-600">
+                          <TrendingUpIcon size={24} />
+                        </div>
+                        <div className="flex-1">
+                          <label className="mb-1 block text-sm font-medium text-slate-600">上涨家数</label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={upCount}
+                            onChange={(event) => setUpCount(event.target.value)}
+                            onFocus={handleFocus}
+                            placeholder="0"
+                            className="w-full rounded-lg border border-slate-200 bg-white px-4 py-2 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-red-400 focus:ring-2 focus:ring-red-400"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="flex items-center space-x-4">
+                        <div className="rounded-lg bg-green-50 p-3 text-green-600">
+                          <TrendingDownIcon size={24} />
+                        </div>
+                        <div className="flex-1">
+                          <label className="mb-1 block text-sm font-medium text-slate-600">下跌家数</label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={downCount}
+                            onChange={(event) => setDownCount(event.target.value)}
+                            onFocus={handleFocus}
+                            placeholder="0"
+                            className="w-full rounded-lg border border-slate-200 bg-white px-4 py-2 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-green-400 focus:ring-2 focus:ring-green-400"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="flex items-center space-x-4">
+                        <div className="rounded-lg bg-slate-100 p-3 text-slate-600">
+                          <MinusIcon size={24} />
+                        </div>
+                        <div className="flex-1">
+                          <label className="mb-1 block text-sm font-medium text-slate-600">平盘家数</label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={flatCount}
+                            onChange={(event) => setFlatCount(event.target.value)}
+                            onFocus={handleFocus}
+                            placeholder="0"
+                            className="w-full rounded-lg border border-slate-200 bg-white px-4 py-2 text-lg font-semibold text-slate-700 outline-none transition-all focus:border-slate-400 focus:ring-2 focus:ring-slate-400"
+                          />
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+                <div className="my-2 h-px w-full bg-slate-100"></div>
+
+                <div className="rounded-xl border border-slate-100 bg-slate-50 p-5">
+                  <div className="mb-4 flex items-center justify-between">
+                    <div className="flex items-center space-x-2 font-semibold text-slate-700">
+                      <ThermometerIcon size={20} className={getTemperatureTextClass(temperature)} />
+                      <span>计数温度</span>
+                    </div>
+                    <div className={`text-3xl font-black ${getTemperatureTextClass(temperature)}`}>
+                      {temperature.toFixed(2)}<span className="ml-1 text-lg">{TEMPERATURE_UNIT}</span>
+                    </div>
+                  </div>
+
+                  <div className="relative h-4 overflow-hidden rounded-full bg-slate-200">
+                    <div
+                      className={`absolute left-0 top-0 h-full transition-all duration-500 ease-out ${getTemperatureColor(temperature)}`}
+                      style={{ width: `${temperature}%` }}
+                    ></div>
+                  </div>
+
+                  <div className="mt-3 text-center text-sm font-medium text-slate-500">
+                    {getTemperatureText(temperature)}
+                  </div>
+
+                  <div className="mt-5 grid gap-3">
+                    <button
+                      type="button"
+                      onClick={() => saveCurrentRecord('manual')}
+                      disabled={!hasValidInput}
+                      className="inline-flex items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 py-3 font-semibold text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+                    >
+                      <SaveIcon size={18} />
+                      <span>保存本次记录</span>
+                    </button>
+
+                    <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-white px-4 py-3">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-700">自动保存</div>
+                        <div className="text-xs text-slate-500">每次输入形成新结果时，自动记录到历史。</div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setAutoSaveEnabled((value) => !value)}
+                        className={`relative inline-flex h-7 w-12 items-center rounded-full transition ${
+                          autoSaveEnabled ? 'bg-emerald-500' : 'bg-slate-300'
+                        }`}
+                        aria-pressed={autoSaveEnabled}
+                        aria-label="切换自动保存"
+                      >
+                        <span
+                          className={`inline-block h-5 w-5 transform rounded-full bg-white transition ${
+                            autoSaveEnabled ? 'translate-x-6' : 'translate-x-1'
+                          }`}
+                        ></span>
+                      </button>
+                    </div>
+
+                    {feedback ? (
+                      <div className={`rounded-xl border px-4 py-3 text-sm font-medium ${feedbackClassMap[feedback.tone] || feedbackClassMap.info}`}>
+                        {feedback.text}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-6">
+              <div className="rounded-3xl border border-slate-100 bg-white p-6 shadow-xl">
+                <div className="mb-5 flex flex-col gap-3 border-b border-slate-100 pb-5 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <div className="flex items-center gap-2 text-slate-800">
+                      <ChartIcon size={20} className="text-blue-600" />
+                      <h2 className="text-xl font-bold">历史分析</h2>
+                    </div>
+                    <p className="mt-1 text-sm text-slate-500">
+                      统计卡片和时间轴会一起按区间切换，默认查看近 20 条记录。
+                    </p>
+                  </div>
+
+                  <div className="relative">
+                    <input
+                      ref={jsonImportInputRef}
+                      type="file"
+                      accept="application/json,.json"
+                      onChange={handleImportJson}
+                      className="hidden"
+                    />
+
+                    <button
+                      type="button"
+                      onClick={() => setDataMenuOpen((value) => !value)}
+                      className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-blue-300 hover:text-blue-700"
+                      aria-expanded={dataMenuOpen}
+                    >
+                      <DownloadIcon size={16} />
+                      <span>数据管理</span>
+                    </button>
+
+                    {dataMenuOpen ? (
+                      <div className="absolute right-0 z-10 mt-2 w-56 rounded-2xl border border-slate-200 bg-white p-2 shadow-xl">
+                        <button
+                          type="button"
+                          onClick={handleExportCsv}
+                          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+                        >
+                          <DownloadIcon size={16} />
+                          <span>导出 CSV</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleExportJson}
+                          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-emerald-700 transition hover:bg-emerald-50"
+                        >
+                          <DownloadIcon size={16} />
+                          <span>导出 JSON 备份</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleImportJsonClick}
+                          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-blue-700 transition hover:bg-blue-50"
+                        >
+                          <DownloadIcon size={16} className="rotate-180" />
+                          <span>导入 JSON 备份</span>
+                        </button>
+
+                        <div className="my-2 h-px bg-slate-100"></div>
+
+                        <button
+                          type="button"
+                          onClick={handleClearHistory}
+                          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-red-600 transition hover:bg-red-50"
+                        >
+                          <TrashIcon size={16} />
+                          <span>清空历史</span>
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+
+                <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                  <StatCard
+                    label="最新温度"
+                    value={stats ? formatTemperature(stats.latest) : '--'}
+                    accentClass={getTemperatureTextClass(stats ? stats.latest : null)}
+                  />
+                  <StatCard
+                    label="平均温度"
+                    value={stats ? formatTemperature(stats.average) : '--'}
+                    accentClass={getTemperatureTextClass(stats ? stats.average : null)}
+                  />
+                  <StatCard
+                    label="最高温度"
+                    value={stats ? formatTemperature(stats.highest) : '--'}
+                    accentClass={getTemperatureTextClass(stats ? stats.highest : null)}
+                  />
+                  <StatCard
+                    label="最低温度"
+                    value={stats ? formatTemperature(stats.lowest) : '--'}
+                    accentClass={getTemperatureTextClass(stats ? stats.lowest : null)}
+                  />
+                </div>
+
+                <div className="mt-5 flex flex-col gap-3 border-t border-slate-100 pt-5 xl:flex-row xl:items-center xl:justify-between">
+                  <div className="flex flex-wrap gap-2">
+                    {RANGE_OPTIONS.map((option) => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        onClick={() => setStatsRange(option.key)}
+                        className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                          statsRange === option.key
+                            ? 'bg-slate-900 text-white'
+                            : 'border border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:text-slate-800'
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-4">
+                    <label className="inline-flex items-center gap-2 text-sm font-semibold text-slate-600">
+                      <input
+                        type="checkbox"
+                        checked={showChartValues}
+                        onChange={(event) => setShowChartValues(event.target.checked)}
+                        className="h-4 w-4 rounded border-slate-300 text-slate-900 focus:ring-slate-400"
+                      />
+                      图上显示温度数值
+                    </label>
+                    <label className="inline-flex items-center gap-2 text-sm font-semibold text-slate-600">
+                      <input
+                        type="checkbox"
+                        checked={showSpxTrend}
+                        onChange={(event) => setShowSpxTrend(event.target.checked)}
+                        className="h-4 w-4 rounded border-slate-300 text-violet-600 focus:ring-violet-400"
+                      />
+                      叠加 SPX 趋势
+                    </label>
+                    <button
+                      type="button"
+                      onClick={refreshSpxForCurrentRange}
+                      disabled={spxRangeFetchLoading || !statsRecords.length}
+                      className="rounded-lg border border-violet-200 bg-violet-50 px-3 py-1.5 text-xs font-semibold text-violet-700 transition hover:bg-violet-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+                    >
+                      {spxRangeFetchLoading ? '刷新中...' : '补齐缺失 SPX'}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-6">
+                  <HistoryChart
+                    records={statsRecords}
+                    rangeLabel={activeRangeOption.label}
+                    timeZone={selectedTimeZone}
+                    showValues={showChartValues}
+                    showSpxTrend={showSpxTrend}
+                    onExpand={() => setChartFullscreenOpen(true)}
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-3xl border border-slate-100 bg-white p-6 shadow-xl">
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <HistoryIcon size={20} className="text-slate-700" />
+                    <h2 className="text-xl font-bold text-slate-800">历史记录</h2>
+                    <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-500">
+                      {historyRecords.length} 条
+                    </span>
+                    {historyDateFilter ? (
+                      <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+                        筛选 {visibleHistoryRecords.length} 条
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {historyRecords.length ? (
+                    <button
+                      type="button"
+                      onClick={() => (bulkModeEnabled ? closeBulkMode() : setBulkModeEnabled(true))}
+                      className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
+                        bulkModeEnabled
+                          ? 'border border-slate-200 bg-white text-slate-700 hover:border-slate-300'
+                          : 'border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'
+                      }`}
+                    >
+                      {bulkModeEnabled ? <XIcon size={16} /> : <CheckSquareIcon size={16} />}
+                      <span>{bulkModeEnabled ? '关闭批量操作' : '批量操作'}</span>
+                    </button>
+                  ) : null}
+                </div>
+
+                {historyRecords.length ? (
+                  <div className="mb-4 flex flex-col gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-4 md:flex-row md:items-end md:justify-between">
+                    <label className="block md:w-64">
+                      <span className="mb-1 block text-xs font-semibold text-slate-500">按日期定位</span>
+                      <input
+                        type="date"
+                        value={historyDateFilter}
+                        onChange={(event) => {
+                          setHistoryDateFilter(event.target.value);
+                          cancelBulkEdit();
+                        }}
+                        className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                      />
+                    </label>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <span className="text-sm text-slate-500">
+                        {historyDateFilter
+                          ? `当前日期找到 ${visibleHistoryRecords.length} 条记录`
+                          : '选择日期后可快速定位当天记录'}
+                      </span>
+                      {historyDateFilter ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setHistoryDateFilter('');
+                            cancelBulkEdit();
+                          }}
+                          className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300"
+                        >
+                          清空筛选
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+
+                {historyRecords.length && bulkModeEnabled ? (
+                  <div className="mb-4 space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                    <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={toggleSelectAllRecords}
+                          className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300"
+                        >
+                          <CheckSquareIcon size={16} />
+                          <span>{allVisibleRecordsSelected ? '取消当前筛选' : '全选当前筛选'}</span>
+                        </button>
+                        <span className="text-sm text-slate-500">
+                          已选择 {selectedCount} 条{historyDateFilter ? `，当前筛选内 ${selectedVisibleCount} 条` : ''}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={beginBulkEdit}
+                          className="inline-flex items-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-700 transition hover:bg-blue-100"
+                        >
+                          <EditIcon size={16} />
+                          <span>批量编辑</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={deleteSelectedRecords}
+                          className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-sm font-semibold text-red-600 transition hover:bg-red-100"
+                        >
+                          <TrashIcon size={16} />
+                          <span>批量删除</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {bulkEditingEnabled ? (
+                      <div className="space-y-4 rounded-2xl border border-blue-200 bg-white p-4">
+                        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                          <div>
+                            <div className="text-sm font-semibold text-slate-800">批量编辑已选记录</div>
+                            <div className="text-xs text-slate-500">你可以逐条修改选中的记录，然后一次性保存。</div>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={saveBulkEditedRecords}
+                              className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-700"
+                            >
+                              <SaveIcon size={16} />
+                              <span>保存全部修改</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={cancelBulkEdit}
+                              className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300"
+                            >
+                              <XIcon size={16} />
+                              <span>取消批量编辑</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="space-y-3">
+                          {visibleHistoryRecords
+                            .filter((record) => selectedRecordIds.includes(record.id))
+                            .map((record) => {
+                              const bulkForm = bulkEditForms[record.id] || {
+                                timestamp: formatDateTimeLocalValue(record.timestamp, selectedTimeZone),
+                                inputMode: record.inputMode || INPUT_MODES.counts,
+                                upCount: String(record.upCount),
+                                downCount: String(record.downCount),
+                                flatCount: String(record.flatCount),
+                                manualTemperature: String(record.temperature),
+                                spxValue: hasSpxValue(record) ? String(record.spxValue) : '',
+                              };
+                              const isBulkManualMode = bulkForm.inputMode === INPUT_MODES.manual;
+
+                              return (
+                                <div key={`bulk-${record.id}`} className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                                  <div className="mb-3 text-sm font-semibold text-slate-700">{formatRecordDate(record.timestamp, selectedTimeZone)}</div>
+                                  <div className="grid gap-3 md:grid-cols-2">
+                                    <label className="block">
+                                      <span className="mb-1 block text-xs font-medium text-slate-500">记录时间</span>
+                                      <input
+                                        type="datetime-local"
+                                        value={bulkForm.timestamp}
+                                        onChange={(event) => handleBulkEditChange(record.id, 'timestamp', event.target.value)}
+                                        className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                                      />
+                                    </label>
+                                    <label className="block">
+                                      <span className="mb-1 block text-xs font-medium text-slate-500">记录方式</span>
+                                      <select
+                                        value={bulkForm.inputMode}
+                                        onChange={(event) => handleBulkEditChange(record.id, 'inputMode', event.target.value)}
+                                        className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                                      >
+                                        <option value={INPUT_MODES.counts}>涨跌家数</option>
+                                        <option value={INPUT_MODES.manual}>手动温度</option>
+                                      </select>
+                                    </label>
+                                  </div>
+                                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                                    <div className="block">
+                                      <span className="mb-1 block text-xs font-medium text-slate-500">SPX 点位</span>
+                                      <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700">
+                                        {bulkForm.spxValue === '' ? '未刷新，可用历史分析里的补齐缺失 SPX' : formatSpxValue(bulkForm.spxValue)}
+                                      </div>
+                                    </div>
+                                  </div>
+                                  {isBulkManualMode ? (
+                                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                                      <label className="block">
+                                        <span className="mb-1 block text-xs font-medium text-slate-500">历史温度</span>
+                                        <input
+                                          type="number"
+                                          min="0"
+                                          max="100"
+                                          step="0.01"
+                                          value={bulkForm.manualTemperature}
+                                          onChange={(event) => handleBulkEditChange(record.id, 'manualTemperature', event.target.value)}
+                                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                                        />
+                                      </label>
+                                    </div>
+                                  ) : (
+                                    <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                                      <label className="block">
+                                        <span className="mb-1 block text-xs font-medium text-slate-500">上涨家数</span>
+                                        <input
+                                          type="number"
+                                          min="0"
+                                          value={bulkForm.upCount}
+                                          onChange={(event) => handleBulkEditChange(record.id, 'upCount', event.target.value)}
+                                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-red-400 focus:ring-2 focus:ring-red-200"
+                                        />
+                                      </label>
+                                      <label className="block">
+                                        <span className="mb-1 block text-xs font-medium text-slate-500">下跌家数</span>
+                                        <input
+                                          type="number"
+                                          min="0"
+                                          value={bulkForm.downCount}
+                                          onChange={(event) => handleBulkEditChange(record.id, 'downCount', event.target.value)}
+                                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-green-400 focus:ring-2 focus:ring-green-200"
+                                        />
+                                      </label>
+                                      <label className="block">
+                                        <span className="mb-1 block text-xs font-medium text-slate-500">平盘家数</span>
+                                        <input
+                                          type="number"
+                                          min="0"
+                                          value={bulkForm.flatCount}
+                                          onChange={(event) => handleBulkEditChange(record.id, 'flatCount', event.target.value)}
+                                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"
+                                        />
+                                      </label>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {historyRecords.length ? (
+                  <div className="max-h-[460px] space-y-3 overflow-y-auto pr-1">
+                    {visibleHistoryRecords.length ? visibleHistoryRecords.map((record) => (
+                      <div
+                        key={record.id}
+                        className="rounded-2xl border border-slate-200 bg-slate-50 p-4 transition hover:border-slate-300"
+                      >
+                        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                          <div className="flex items-start gap-3">
+                            {bulkModeEnabled ? (
+                              <input
+                                type="checkbox"
+                                checked={selectedRecordIds.includes(record.id)}
+                                onChange={() => toggleRecordSelection(record.id)}
+                                className="mt-1 h-4 w-4 rounded border-slate-300 text-slate-900 focus:ring-slate-400"
+                              />
+                            ) : null}
+                            <div>
+                              <div className="text-sm font-semibold text-slate-800">{formatRecordDate(record.timestamp, selectedTimeZone)}</div>
+                              <div className="mt-1 text-xs text-slate-500">
+                                {isManualRecord(record)
+                                  ? '手动录入温度，用于补齐缺少涨跌家数的历史。'
+                                  : `总家数 ${record.totalCount.toFixed(0)}，可对照当时盘面宽度变化。`}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            {!bulkModeEnabled ? (
+                              <button
+                                type="button"
+                                onClick={() => (editingRecordId === record.id ? cancelEditRecord() : beginEditRecord(record))}
+                                className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-sm font-semibold transition ${
+                                  editingRecordId === record.id
+                                    ? 'bg-slate-200 text-slate-700 hover:bg-slate-300'
+                                    : 'bg-blue-50 text-blue-700 hover:bg-blue-100'
+                                }`}
+                              >
+                                {editingRecordId === record.id ? <XIcon size={14} /> : <EditIcon size={14} />}
+                                <span>{editingRecordId === record.id ? '取消' : '编辑'}</span>
+                              </button>
+                            ) : null}
+                            <div className="rounded-full bg-white px-3 py-1 text-sm font-bold text-slate-800 shadow-sm">
+                              {formatTemperature(record.temperature)}
+                            </div>
+                            {hasSpxValue(record) ? (
+                              <div className="rounded-full bg-violet-50 px-3 py-1 text-sm font-bold text-violet-700 shadow-sm">
+                                SPX {formatSpxValue(record.spxValue)}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+
+                        {editingRecordId === record.id ? (
+                          <div className="mt-4 space-y-4 rounded-2xl border border-blue-200 bg-white p-4">
+                            <div className="grid gap-3 md:grid-cols-2">
+                              <label className="block">
+                                <span className="mb-1 block text-xs font-medium text-slate-500">记录时间</span>
+                                <input
+                                  type="datetime-local"
+                                  value={editForm.timestamp}
+                                  onChange={(event) => handleEditFormChange('timestamp', event.target.value)}
+                                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                                />
+                              </label>
+                              <label className="block">
+                                <span className="mb-1 block text-xs font-medium text-slate-500">记录方式</span>
+                                <select
+                                  value={editForm.inputMode}
+                                  onChange={(event) => handleEditFormChange('inputMode', event.target.value)}
+                                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                                >
+                                  <option value={INPUT_MODES.counts}>涨跌家数</option>
+                                  <option value={INPUT_MODES.manual}>手动温度</option>
+                                </select>
+                              </label>
+                            </div>
+
+                            <div className="grid gap-3 sm:grid-cols-2">
+                              <label className="block">
+                                <span className="mb-1 block text-xs font-medium text-slate-500">SPX 点位</span>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  step="0.01"
+                                  value={editForm.spxValue}
+                                  onChange={(event) => handleEditFormChange('spxValue', event.target.value)}
+                                  placeholder="留空表示未记录"
+                                  className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-violet-400 focus:ring-2 focus:ring-violet-200"
+                                />
+                              </label>
+                            </div>
+
+                            {editForm.inputMode === INPUT_MODES.manual ? (
+                              <div className="grid gap-3 sm:grid-cols-2">
+                                <label className="block">
+                                  <span className="mb-1 block text-xs font-medium text-slate-500">历史温度</span>
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    max="100"
+                                    step="0.01"
+                                    value={editForm.manualTemperature}
+                                    onChange={(event) => handleEditFormChange('manualTemperature', event.target.value)}
+                                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                                  />
+                                </label>
+                              </div>
+                            ) : (
+                              <div className="grid gap-3 sm:grid-cols-3">
+                                <label className="block">
+                                  <span className="mb-1 block text-xs font-medium text-slate-500">上涨家数</span>
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    value={editForm.upCount}
+                                    onChange={(event) => handleEditFormChange('upCount', event.target.value)}
+                                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-red-400 focus:ring-2 focus:ring-red-200"
+                                  />
+                                </label>
+                                <label className="block">
+                                  <span className="mb-1 block text-xs font-medium text-slate-500">下跌家数</span>
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    value={editForm.downCount}
+                                    onChange={(event) => handleEditFormChange('downCount', event.target.value)}
+                                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-green-400 focus:ring-2 focus:ring-green-200"
+                                  />
+                                </label>
+                                <label className="block">
+                                  <span className="mb-1 block text-xs font-medium text-slate-500">平盘家数</span>
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    value={editForm.flatCount}
+                                    onChange={(event) => handleEditFormChange('flatCount', event.target.value)}
+                                    className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200"
+                                  />
+                                </label>
+                              </div>
+                            )}
+
+                            <div className="flex flex-wrap gap-3">
+                              <button
+                                type="button"
+                                onClick={() => saveEditedRecord(record.id)}
+                                className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-700"
+                              >
+                                <SaveIcon size={16} />
+                                <span>保存修改</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => deleteRecord(record.id)}
+                                className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-semibold text-red-600 transition hover:bg-red-100"
+                              >
+                                <TrashIcon size={16} />
+                                <span>删除此条</span>
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          isManualRecord(record) ? (
+                            <div className="mt-4 rounded-xl bg-white px-3 py-2">
+                              <div className="text-xs font-medium text-slate-500">记录来源</div>
+                              <div className="mt-1 text-lg font-bold text-blue-700">手动温度</div>
+                            </div>
+                          ) : (
+                            <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                              <div className="rounded-xl bg-white px-3 py-2">
+                                <div className="text-xs font-medium text-slate-500">上涨家数</div>
+                                <div className="mt-1 text-lg font-bold text-red-600">{record.upCount}</div>
+                              </div>
+                              <div className="rounded-xl bg-white px-3 py-2">
+                                <div className="text-xs font-medium text-slate-500">下跌家数</div>
+                                <div className="mt-1 text-lg font-bold text-green-600">{record.downCount}</div>
+                              </div>
+                              <div className="rounded-xl bg-white px-3 py-2">
+                                <div className="text-xs font-medium text-slate-500">平盘家数</div>
+                                <div className="mt-1 text-lg font-bold text-slate-700">{record.flatCount}</div>
+                              </div>
+                            </div>
+                          )
+                        )}
+                      </div>
+                    )) : (
+                      <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
+                        这个日期没有历史记录。换一天看看，或清空筛选回到全部记录。
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-12 text-center text-sm text-slate-500">
+                    历史列表目前是空的。输入数字后点击“保存本次记录”，或打开自动保存，就会开始累积你的温度数据。
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {chartFullscreenOpen ? (
+            <div className="fixed inset-0 z-50 bg-slate-950/80 p-4 backdrop-blur-sm">
+              <div className="mx-auto flex h-full max-w-7xl items-center">
+                <HistoryChart
+                  records={statsRecords}
+                  rangeLabel={activeRangeOption.label}
+                  timeZone={selectedTimeZone}
+                  showValues={showChartValues}
+                  showSpxTrend={showSpxTrend}
+                  isFullscreen={true}
+                  onClose={() => setChartFullscreenOpen(false)}
+                  rangeOptions={RANGE_OPTIONS}
+                  activeRangeKey={statsRange}
+                  onRangeChange={setStatsRange}
+                />
+              </div>
+            </div>
+          ) : null}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
