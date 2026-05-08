@@ -29,6 +29,12 @@
       schemaVersion: 'market-temperature-schema-version-v1',
       migrationBackup: 'market-temperature-history-backup-before-v3-v1',
     };
+    const LOCAL_FILE_STORAGE = {
+      dbName: 'market-temperature-local-file-v1',
+      storeName: 'handles',
+      handleKey: 'history-json-file',
+      defaultFileName: 'market-temperature-data.json',
+    };
     const TEMPERATURE_UNIT = '°';
     const SPX_SYMBOL = '^GSPC';
     const SPX_DATA_SOURCE = 'Financial Modeling Prep';
@@ -419,6 +425,65 @@
       link.click();
       document.body.removeChild(link);
       window.setTimeout(() => window.URL.revokeObjectURL(url), 0);
+    };
+
+    const createBackupPayload = (records, preferences = {}) => ({
+      app: 'market-temperature-calculator',
+      schemaVersion: CURRENT_DATA_SCHEMA_VERSION,
+      exportedAt: new Date().toISOString(),
+      preferences: {
+        autoSaveEnabled: Boolean(preferences.autoSaveEnabled),
+        selectedTimeZone: getValidTimeZone(preferences.selectedTimeZone),
+        showChartValues: preferences.showChartValues !== false,
+        showSpxTrend: Boolean(preferences.showSpxTrend),
+      },
+      records: normalizeHistoryRecords(records),
+    });
+
+    const isLocalFileSaveSupported = () =>
+      Boolean(window.showSaveFilePicker && window.indexedDB);
+
+    const openLocalFileDb = () =>
+      new Promise((resolve, reject) => {
+        const request = window.indexedDB.open(LOCAL_FILE_STORAGE.dbName, 1);
+        request.onupgradeneeded = () => {
+          request.result.createObjectStore(LOCAL_FILE_STORAGE.storeName);
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+
+    const withLocalFileStore = async (mode, callback) => {
+      const db = await openLocalFileDb();
+      try {
+        return await new Promise((resolve, reject) => {
+          const transaction = db.transaction(LOCAL_FILE_STORAGE.storeName, mode);
+          const store = transaction.objectStore(LOCAL_FILE_STORAGE.storeName);
+          const result = callback(store);
+          transaction.oncomplete = () => resolve(result && result.result);
+          transaction.onerror = () => reject(transaction.error);
+        });
+      } finally {
+        db.close();
+      }
+    };
+
+    const saveLocalFileHandle = (handle) =>
+      withLocalFileStore('readwrite', (store) => store.put(handle, LOCAL_FILE_STORAGE.handleKey));
+
+    const loadLocalFileHandle = () =>
+      withLocalFileStore('readonly', (store) => store.get(LOCAL_FILE_STORAGE.handleKey));
+
+    const verifyLocalFilePermission = async (handle, mode = 'readwrite') => {
+      const options = { mode };
+      if (await handle.queryPermission(options) === 'granted') return true;
+      return (await handle.requestPermission(options)) === 'granted';
+    };
+
+    const writeTextToLocalFile = async (handle, content) => {
+      const writable = await handle.createWritable();
+      await writable.write(content);
+      await writable.close();
     };
 
     // 定义所需图标 (SVG 格式)
@@ -1521,6 +1586,11 @@
       const [selectedRecordIds, setSelectedRecordIds] = useState([]);
       const [bulkEditingEnabled, setBulkEditingEnabled] = useState(false);
       const [dataMenuOpen, setDataMenuOpen] = useState(false);
+      const [localFileSaveSupported] = useState(isLocalFileSaveSupported);
+      const [localFileConnected, setLocalFileConnected] = useState(false);
+      const [localFileName, setLocalFileName] = useState('');
+      const [localFileSaving, setLocalFileSaving] = useState(false);
+      const [localFileStatus, setLocalFileStatus] = useState('');
       const [historyDateFilter, setHistoryDateFilter] = useState('');
       const [chartFullscreenOpen, setChartFullscreenOpen] = useState(false);
       const [spxRangeFetchLoading, setSpxRangeFetchLoading] = useState(false);
@@ -1538,6 +1608,8 @@
       const historyRef = useRef(historyRecords);
       const lastAutoSavedSignatureRef = useRef('');
       const jsonImportInputRef = useRef(null);
+      const localFileHandleRef = useRef(null);
+      const localFileSaveRequestRef = useRef(0);
 
       const upValue = safeNumber(upCount);
       const downValue = safeNumber(downCount);
@@ -1569,6 +1641,49 @@
       const selectedVisibleCount = selectedRecordIds.filter((id) => visibleRecordIds.includes(id)).length;
       const allVisibleRecordsSelected = visibleRecordIds.length > 0 && selectedVisibleCount === visibleRecordIds.length;
       const selectedCount = selectedRecordIds.length;
+
+      const getCurrentBackupPayload = () =>
+        createBackupPayload(historyRef.current, {
+          autoSaveEnabled,
+          selectedTimeZone,
+          showChartValues,
+          showSpxTrend,
+        });
+
+      const persistToLocalFile = async (statusText = '本地文件已同步。') => {
+        const handle = localFileHandleRef.current;
+        if (!handle) return;
+
+        const requestId = localFileSaveRequestRef.current + 1;
+        localFileSaveRequestRef.current = requestId;
+        setLocalFileSaving(true);
+
+        try {
+          const hasPermission = await verifyLocalFilePermission(handle);
+          if (!hasPermission) {
+            setLocalFileConnected(false);
+            setLocalFileStatus('本地文件权限已失效，请重新关联文件。');
+            return;
+          }
+
+          await writeTextToLocalFile(
+            handle,
+            JSON.stringify(getCurrentBackupPayload(), null, 2)
+          );
+
+          if (requestId === localFileSaveRequestRef.current) {
+            setLocalFileConnected(true);
+            setLocalFileStatus(statusText);
+          }
+        } catch (error) {
+          setLocalFileConnected(false);
+          setLocalFileStatus('写入本地文件失败，请重新关联或导出 JSON 备份。');
+        } finally {
+          if (requestId === localFileSaveRequestRef.current) {
+            setLocalFileSaving(false);
+          }
+        }
+      };
 
       useEffect(() => {
         historyRef.current = historyRecords;
@@ -1610,6 +1725,48 @@
           // 忽略 localStorage 异常，避免影响主要计算流程。
         }
       }, [showSpxTrend]);
+
+      useEffect(() => {
+        if (!localFileSaveSupported) {
+          setLocalFileStatus('当前浏览器不支持自动写入本地文件，可继续使用 JSON 导出备份。');
+          return undefined;
+        }
+
+        let cancelled = false;
+        loadLocalFileHandle()
+          .then(async (handle) => {
+            if (cancelled || !handle) return;
+            localFileHandleRef.current = handle;
+            setLocalFileName(handle.name || LOCAL_FILE_STORAGE.defaultFileName);
+
+            const hasPermission = (await handle.queryPermission({ mode: 'readwrite' })) === 'granted';
+            if (cancelled) return;
+            if (!hasPermission) {
+              setLocalFileStatus('已找到之前的本地文件，请重新授权后继续自动保存。');
+              return;
+            }
+
+            setLocalFileConnected(true);
+            await persistToLocalFile('已连接本地文件，后续修改会自动同步。');
+          })
+          .catch(() => {
+            if (!cancelled) {
+              setLocalFileStatus('读取本地文件授权失败，可重新关联文件。');
+            }
+          });
+
+        return () => {
+          cancelled = true;
+        };
+      }, [localFileSaveSupported]);
+
+      useEffect(() => {
+        if (!localFileConnected) return undefined;
+        const timeoutId = window.setTimeout(() => {
+          persistToLocalFile();
+        }, 350);
+        return () => window.clearTimeout(timeoutId);
+      }, [historyRecords, autoSaveEnabled, selectedTimeZone, showChartValues, showSpxTrend, localFileConnected]);
 
       useEffect(() => {
         if (!feedback) return undefined;
@@ -2023,6 +2180,40 @@
         setFeedback({ tone: 'success', text: `已删除 ${selectedSet.size} 条历史记录。` });
       };
 
+      const handleConnectLocalFile = async () => {
+        if (!localFileSaveSupported) {
+          setFeedback({ tone: 'error', text: '当前浏览器不支持自动写入本地文件，请使用 Chrome 或 Edge，或继续导出 JSON 备份。' });
+          setDataMenuOpen(false);
+          return;
+        }
+
+        try {
+          const handle = await window.showSaveFilePicker({
+            suggestedName: LOCAL_FILE_STORAGE.defaultFileName,
+            types: [
+              {
+                description: 'Market Temperature JSON',
+                accept: { 'application/json': ['.json'] },
+              },
+            ],
+          });
+
+          localFileHandleRef.current = handle;
+          setLocalFileName(handle.name || LOCAL_FILE_STORAGE.defaultFileName);
+          await saveLocalFileHandle(handle);
+          setLocalFileConnected(true);
+          await persistToLocalFile('已关联本地 JSON 文件，后续修改会自动保存到这个文件。');
+          setFeedback({ tone: 'success', text: '本地文件自动保存已启用。' });
+          setDataMenuOpen(false);
+        } catch (error) {
+          if (error && error.name === 'AbortError') {
+            setFeedback({ tone: 'info', text: '已取消关联本地文件。' });
+            return;
+          }
+          setFeedback({ tone: 'error', text: '关联本地文件失败，请重新选择保存位置。' });
+        }
+      };
+
       const handleExportCsv = () => {
         if (!historyRef.current.length) {
           setFeedback({ tone: 'info', text: '还没有历史记录可以导出。' });
@@ -2054,19 +2245,7 @@
       };
 
       const handleExportJson = () => {
-        const backup = {
-          app: 'market-temperature-calculator',
-          schemaVersion: CURRENT_DATA_SCHEMA_VERSION,
-          exportedAt: new Date().toISOString(),
-          preferences: {
-            autoSaveEnabled,
-            selectedTimeZone,
-            showChartValues,
-            showSpxTrend,
-          },
-          records: normalizeHistoryRecords(historyRef.current),
-        };
-
+        const backup = getCurrentBackupPayload();
         const dateStamp = formatFileDate();
         downloadTextFile(
           JSON.stringify(backup, null, 2),
@@ -2484,6 +2663,24 @@
                       </button>
                     </div>
 
+                    <div className="rounded-xl border border-blue-100 bg-blue-50 px-4 py-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold text-slate-700">本地文件保存</div>
+                          <div className="mt-1 text-xs leading-5 text-slate-500">
+                            {localFileConnected
+                              ? `${localFileName || LOCAL_FILE_STORAGE.defaultFileName} ${localFileSaving ? '正在同步...' : '已自动同步'}`
+                              : (localFileStatus || '在数据管理中关联一个本地 JSON 文件后，历史数据会写入你电脑上的文件。')}
+                          </div>
+                        </div>
+                        <span className={`shrink-0 rounded-full px-2 py-1 text-xs font-semibold ${
+                          localFileConnected ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'
+                        }`}>
+                          {localFileConnected ? '已启用' : '未启用'}
+                        </span>
+                      </div>
+                    </div>
+
                     {feedback ? (
                       <div className={`rounded-xl border px-4 py-3 text-sm font-medium ${feedbackClassMap[feedback.tone] || feedbackClassMap.info}`}>
                         {feedback.text}
@@ -2528,6 +2725,17 @@
 
                     {dataMenuOpen ? (
                       <div className="absolute right-0 z-10 mt-2 w-56 rounded-2xl border border-slate-200 bg-white p-2 shadow-xl">
+                        <button
+                          type="button"
+                          onClick={handleConnectLocalFile}
+                          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-indigo-700 transition hover:bg-indigo-50"
+                        >
+                          <SaveIcon size={16} />
+                          <span>{localFileConnected ? '更换本地保存文件' : '启用本地文件保存'}</span>
+                        </button>
+
+                        <div className="my-2 h-px bg-slate-100"></div>
+
                         <button
                           type="button"
                           onClick={handleExportCsv}
