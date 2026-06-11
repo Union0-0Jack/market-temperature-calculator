@@ -738,6 +738,368 @@
       );
     }
 
+    const FIBONACCI_MODES = {
+      retracementUp: {
+        label: '上升回调',
+        type: 'retracement',
+        formula: '目标价 = H - (H - L) × r',
+        note: 'L 为波段低点，H 为波段高点，r 为回调比例。',
+        fields: [
+          { key: 'L', label: 'L：波段低点', placeholder: '例如 100' },
+          { key: 'H', label: 'H：波段高点', placeholder: '例如 200' },
+        ],
+        calculate: (values, ratio) => values.H - (values.H - values.L) * ratio,
+      },
+      retracementDown: {
+        label: '下降回调',
+        type: 'retracement',
+        formula: '目标价 = L + (H - L) × r',
+        note: 'H 为波段高点，L 为波段低点，r 为反弹回调比例。',
+        fields: [
+          { key: 'H', label: 'H：波段高点', placeholder: '例如 200' },
+          { key: 'L', label: 'L：波段低点', placeholder: '例如 100' },
+        ],
+        calculate: (values, ratio) => values.L + (values.H - values.L) * ratio,
+      },
+      extensionUp: {
+        label: '上升扩展',
+        type: 'extension',
+        formula: '目标价 = C + (B - A) × e',
+        note: 'A 为起涨低点，B 为波段高点，C 为回调低点，e 为扩展比例。',
+        fields: [
+          { key: 'A', label: 'A：起涨低点', placeholder: '例如 100' },
+          { key: 'B', label: 'B：波段高点', placeholder: '例如 200' },
+          { key: 'C', label: 'C：回调低点', placeholder: '例如 150' },
+        ],
+        calculate: (values, ratio) => values.C + (values.B - values.A) * ratio,
+      },
+      extensionDown: {
+        label: '下降扩展',
+        type: 'extension',
+        formula: '目标价 = C - (A - B) × e',
+        note: 'A 为起跌高点，B 为波段低点，C 为反弹高点，e 为扩展比例。',
+        fields: [
+          { key: 'A', label: 'A：起跌高点', placeholder: '例如 200' },
+          { key: 'B', label: 'B：波段低点', placeholder: '例如 100' },
+          { key: 'C', label: 'C：反弹高点', placeholder: '例如 150' },
+        ],
+        calculate: (values, ratio) => values.C - (values.A - values.B) * ratio,
+      },
+    };
+
+    const FIBONACCI_RATIOS = {
+      retracement: [0.236, 0.382, 0.5, 0.618, 0.786],
+      extension: [0.618, 1, 1.272, 1.618, 2.618],
+    };
+
+    const formatFibonacciNumber = (value) => {
+      const normalized = Math.abs(value) < 0.00005 ? 0 : value;
+      return normalized.toLocaleString('zh-CN', {
+        maximumFractionDigits: 4,
+      });
+    };
+
+    const formatFibonacciRatio = (ratio) =>
+      `${(ratio * 100).toLocaleString('zh-CN', {
+        maximumFractionDigits: 4,
+        useGrouping: false,
+      })}%`;
+
+    function FibonacciCalculator() {
+      const [mode, setMode] = useState('retracementUp');
+      const [valuesByMode, setValuesByMode] = useState({
+        retracementUp: {},
+        retracementDown: {},
+        extensionUp: {},
+        extensionDown: {},
+      });
+      const [touchedByMode, setTouchedByMode] = useState({
+        retracementUp: {},
+        retracementDown: {},
+        extensionUp: {},
+        extensionDown: {},
+      });
+      const [customRatios, setCustomRatios] = useState({
+        retracement: [],
+        extension: [],
+      });
+      const [ratioInput, setRatioInput] = useState('');
+      const [ratioError, setRatioError] = useState('');
+
+      const config = FIBONACCI_MODES[mode];
+      const rawValues = valuesByMode[mode];
+      const touched = touchedByMode[mode];
+      const parsedValues = {};
+      const errors = {};
+
+      config.fields.forEach((field) => {
+        const rawValue = rawValues[field.key] || '';
+        const value = Number(rawValue);
+        if (rawValue !== '' && Number.isFinite(value)) {
+          parsedValues[field.key] = value;
+        } else if (touched[field.key]) {
+          errors[field.key] = rawValue === '' ? '请输入价格。' : '请输入有效数字。';
+        }
+      });
+
+      const complete = Object.keys(parsedValues).length === config.fields.length;
+      if (complete) {
+        if (mode === 'retracementUp' && parsedValues.L >= parsedValues.H) {
+          errors.H = '波段高点必须大于波段低点。';
+        } else if (mode === 'retracementDown' && parsedValues.H <= parsedValues.L) {
+          errors.L = '波段低点必须小于波段高点。';
+        } else if (mode === 'extensionUp' && parsedValues.A >= parsedValues.B) {
+          errors.B = '波段高点 B 必须大于起涨低点 A。';
+        } else if (mode === 'extensionDown' && parsedValues.A <= parsedValues.B) {
+          errors.B = '波段低点 B 必须小于起跌高点 A。';
+        }
+      }
+
+      const valid = complete && Object.keys(errors).length === 0;
+      const ratios = [...FIBONACCI_RATIOS[config.type], ...customRatios[config.type]]
+        .filter((ratio, index, list) =>
+          list.findIndex((candidate) => Math.abs(candidate - ratio) < 0.0000001) === index
+        )
+        .sort((a, b) => a - b);
+      const results = valid
+        ? ratios.map((ratio) => ({
+            ratio,
+            value: config.calculate(parsedValues, ratio),
+            custom: customRatios[config.type].some((candidate) => Math.abs(candidate - ratio) < 0.0000001),
+          }))
+        : [];
+      const hasNegativeResult = results.some((result) => result.value < 0);
+      const cOutsideRange = config.type === 'extension'
+        && valid
+        && (parsedValues.C < Math.min(parsedValues.A, parsedValues.B)
+          || parsedValues.C > Math.max(parsedValues.A, parsedValues.B));
+
+      const updateValue = (key, value) => {
+        setValuesByMode((current) => ({
+          ...current,
+          [mode]: {
+            ...current[mode],
+            [key]: value,
+          },
+        }));
+      };
+
+      const markTouched = (key) => {
+        setTouchedByMode((current) => ({
+          ...current,
+          [mode]: {
+            ...current[mode],
+            [key]: true,
+          },
+        }));
+      };
+
+      const changeMode = (nextMode) => {
+        setMode(nextMode);
+        setRatioInput('');
+        setRatioError('');
+      };
+
+      const addCustomRatio = (event) => {
+        event.preventDefault();
+        const percentage = Number(ratioInput);
+        if (ratioInput.trim() === '' || !Number.isFinite(percentage) || percentage <= 0) {
+          setRatioError('请输入大于 0 的有效百分比。');
+          return;
+        }
+
+        const ratio = percentage / 100;
+        const exists = [...FIBONACCI_RATIOS[config.type], ...customRatios[config.type]]
+          .some((candidate) => Math.abs(candidate - ratio) < 0.0000001);
+        if (exists) {
+          setRatioError('该比例已经在结果列表中。');
+          return;
+        }
+
+        setCustomRatios((current) => ({
+          ...current,
+          [config.type]: [...current[config.type], ratio],
+        }));
+        setRatioInput('');
+        setRatioError('');
+      };
+
+      const removeCustomRatio = (ratio) => {
+        setCustomRatios((current) => ({
+          ...current,
+          [config.type]: current[config.type].filter(
+            (candidate) => Math.abs(candidate - ratio) >= 0.0000001
+          ),
+        }));
+      };
+
+      const resetCurrentMode = () => {
+        setValuesByMode((current) => ({ ...current, [mode]: {} }));
+        setTouchedByMode((current) => ({ ...current, [mode]: {} }));
+        setCustomRatios((current) => ({ ...current, [config.type]: [] }));
+        setRatioInput('');
+        setRatioError('');
+      };
+
+      return (
+        <div className="mx-auto max-w-4xl">
+          <div className="overflow-hidden rounded-3xl border border-slate-100 bg-white shadow-xl">
+            <div className="bg-slate-800 p-6 text-center text-white">
+              <div className="mb-3 flex justify-center">
+                <TargetIcon size={40} className="text-amber-300" />
+              </div>
+              <h1 className="text-2xl font-bold tracking-wider">斐波那契计算器</h1>
+              <p className="mt-2 text-sm text-slate-400 opacity-80">计算趋势回调支撑、阻力与突破后的扩展目标价位</p>
+            </div>
+
+            <div className="space-y-6 p-6">
+              <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-1 sm:grid-cols-4">
+                {Object.entries(FIBONACCI_MODES).map(([key, option]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => changeMode(key)}
+                    className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                      mode === key ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="rounded-2xl border border-blue-100 bg-blue-50 p-4">
+                <div className="text-xs font-bold uppercase tracking-[0.14em] text-blue-700">当前公式</div>
+                <div className="mt-2 break-words font-mono text-lg font-black text-slate-900">{config.formula}</div>
+                <div className="mt-2 text-sm text-slate-500">{config.note}</div>
+              </div>
+
+              <div>
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <h2 className="text-lg font-bold text-slate-800">价格输入</h2>
+                  <button
+                    type="button"
+                    onClick={resetCurrentMode}
+                    className="text-sm font-bold text-blue-700 transition hover:text-blue-900"
+                  >
+                    重置
+                  </button>
+                </div>
+                <div className={`grid gap-4 ${config.fields.length === 3 ? 'md:grid-cols-3' : 'sm:grid-cols-2'}`}>
+                  {config.fields.map((field) => (
+                    <label key={field.key} className="block">
+                      <span className="mb-1 block text-sm font-medium text-slate-600">{field.label}</span>
+                      <input
+                        type="number"
+                        step="any"
+                        inputMode="decimal"
+                        value={rawValues[field.key] || ''}
+                        onChange={(event) => updateValue(field.key, event.target.value)}
+                        onBlur={() => markTouched(field.key)}
+                        onFocus={(event) => event.target.select()}
+                        placeholder={field.placeholder}
+                        className={`w-full rounded-lg border bg-white px-4 py-3 font-mono text-lg font-semibold text-slate-700 outline-none transition-all ${
+                          errors[field.key]
+                            ? 'border-red-300 bg-red-50 focus:border-red-400 focus:ring-2 focus:ring-red-100'
+                            : 'border-slate-200 focus:border-blue-400 focus:ring-2 focus:ring-blue-200'
+                        }`}
+                      />
+                      <span className="mt-1 block min-h-[18px] text-xs font-medium text-red-600">
+                        {errors[field.key] || ''}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+                {cOutsideRange ? (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-800">
+                    提示：C 点位于 A–B 波段范围之外，仍会按输入值计算扩展目标。
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="border-t border-slate-200 pt-6">
+                <h2 className="mb-3 text-lg font-bold text-slate-800">自定义比例</h2>
+                <form onSubmit={addCustomRatio} className="flex gap-2">
+                  <div className="relative min-w-0 flex-1">
+                    <input
+                      type="number"
+                      min="0"
+                      step="any"
+                      inputMode="decimal"
+                      value={ratioInput}
+                      onChange={(event) => {
+                        setRatioInput(event.target.value);
+                        setRatioError('');
+                      }}
+                      placeholder="例如 88.6"
+                      className="w-full rounded-lg border border-slate-200 bg-white px-4 py-3 pr-10 font-mono text-lg font-semibold text-slate-700 outline-none transition-all focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
+                    />
+                    <span className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 font-bold text-slate-400">%</span>
+                  </div>
+                  <button
+                    type="submit"
+                    className="shrink-0 rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700"
+                  >
+                    添加比例
+                  </button>
+                </form>
+                <div className="mt-1 min-h-[20px] text-xs font-medium text-red-600">{ratioError}</div>
+                {customRatios[config.type].length ? (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {customRatios[config.type].map((ratio) => (
+                      <div key={ratio} className="inline-flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-bold text-blue-800">
+                        <span>{formatFibonacciRatio(ratio)}</span>
+                        <button type="button" onClick={() => removeCustomRatio(ratio)} className="text-blue-600 hover:text-blue-900">
+                          删除
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="border-t border-slate-200 pt-6">
+                <h2 className="mb-3 text-lg font-bold text-slate-800">计算结果</h2>
+                {!valid ? (
+                  <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
+                    {complete ? '请修正价格输入后查看计算结果。' : '输入有效价格后，将自动显示全部常用比例的目标价。'}
+                  </div>
+                ) : (
+                  <div className="grid gap-3">
+                    {results.map((result) => (
+                      <div
+                        key={result.ratio}
+                        className={`flex items-center justify-between gap-4 rounded-xl border border-l-4 p-4 ${
+                          result.value < 0
+                            ? 'border-amber-200 border-l-amber-600 bg-amber-50'
+                            : 'border-emerald-100 border-l-emerald-600 bg-emerald-50'
+                        }`}
+                      >
+                        <div>
+                          <div className="text-sm font-bold text-slate-600">
+                            {formatFibonacciRatio(result.ratio)} {config.type === 'retracement' ? '回调位' : '扩展位'}
+                          </div>
+                          <div className="mt-1 text-xs text-slate-500">{result.custom ? '自定义比例' : '常用比例'}</div>
+                        </div>
+                        <div className="break-all text-right font-mono text-2xl font-black text-slate-900">
+                          {formatFibonacciNumber(result.value)}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {config.type === 'extension' && hasNegativeResult ? (
+                  <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-800">
+                    部分扩展目标低于 0。结果按公式保留，请确认所选波段是否合理。
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     function KLineNextDayCalculator() {
       const [candleType, setCandleType] = useState('bullish');
       const [high, setHigh] = useState('');
@@ -2362,7 +2724,7 @@
 
       const renderToolTabs = () => (
         <div className="mx-auto mb-6 max-w-6xl">
-          <div className="grid gap-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-sm sm:grid-cols-3">
+          <div className="grid gap-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-sm sm:grid-cols-2 lg:grid-cols-4">
             <button
               type="button"
               onClick={() => setActiveToolTab('temperature')}
@@ -2399,9 +2761,30 @@
               <CandlestickIcon size={18} />
               <span>K线次日高低点</span>
             </button>
+            <button
+              type="button"
+              onClick={() => setActiveToolTab('fibonacci')}
+              className={`inline-flex items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-bold transition ${
+                activeToolTab === 'fibonacci'
+                  ? 'bg-slate-900 text-white shadow-sm'
+                  : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+              }`}
+            >
+              <TargetIcon size={18} />
+              <span>斐波那契</span>
+            </button>
           </div>
         </div>
       );
+
+      if (activeToolTab === 'fibonacci') {
+        return (
+          <div className="min-h-screen bg-slate-50 px-4 py-6 font-sans text-slate-800 lg:px-6">
+            {renderToolTabs()}
+            <FibonacciCalculator />
+          </div>
+        );
+      }
 
       if (activeToolTab === 'kLine') {
         return (
